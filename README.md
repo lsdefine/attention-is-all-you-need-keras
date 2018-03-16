@@ -7,7 +7,7 @@ Please refer to *en2de_main.py* and *pinyin_main.py*
 - This task is same as in [jadore801120/attention-is-all-you-need-pytorch](https://github.com/jadore801120/attention-is-all-you-need-pytorch): WMT'16 Multimodal Translation: Multi30k (de-en) [(http://www.statmt.org/wmt16/multimodal-task.html)](http://www.statmt.org/wmt16/multimodal-task.html). We borrowed the data proprocessing step 0 and 1 in the repository, and then construct the input file *en2de.s2s.txt*
 #### Results
 - The code achieves near results as in the repository: about 70% valid accuracy. 
-If using smaller model parameters, such as *layers=2* and *n_model=256*, the valid accuracy is better since the task is quite small.
+If using smaller model parameters, such as *layers=2* and *d_model=256*, the valid accuracy is better since the task is quite small.
 ### For your own data
 - Just preproess your source and target sequences as the format in *en2de.s2s.txt* and *pinyin.corpus.examples.txt*.
 ### Some notes
