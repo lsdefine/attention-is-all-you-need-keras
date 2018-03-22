@@ -72,7 +72,7 @@ def MakeS2SData(fn=None, itokens=None, otokens=None, delimiter=' ', h5_file=None
 def S2SDataGenerator(fn, itokens, otokens, batch_size=64, delimiter=' ', max_len=999):
 	Xs = [[], []]
 	while True:
-		for	ss in ljqpy.LoadCSVg(fn):
+		for ss in ljqpy.LoadCSVg(fn):
 			for seq, xs in zip(ss, Xs):
 				xs.append(list(seq.split(delimiter)))
 			if len(Xs[0]) >= batch_size:
