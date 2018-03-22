@@ -29,8 +29,8 @@ lr_scheduler = LRSchedulerPerStep(d_model, 4000)   # there is a warning that it 
 #lr_scheduler = LRSchedulerPerEpoch(d_model, 4000, Xtrain.shape[0]/64)  # this scheduler only update lr per epoch
 model_saver = ModelCheckpoint('en2de.model.h5', save_best_only=True, save_weights_only=True)
 
-s2s.model.summary()
 s2s.compile(Adam(0.001, 0.9, 0.98, epsilon=1e-9))
+s2s.model.summary()
 try: s2s.model.load_weights('en2de.model.h5')
 except: print('\n\nnew model')
 s2s.model.fit([Xtrain, Ytrain], None, batch_size=64, epochs=30, \
