@@ -62,7 +62,7 @@ def MakeS2SData(fn=None, itokens=None, otokens=None, delimiter=' ', h5_file=None
 	for ss in data:
 		for seq, xs in zip(ss, Xs):
 			xs.append(list(seq.split(delimiter)))
-	
+	X, Y = pad_to_longest(Xs[0], itokens, max_len), pad_to_longest(Xs[1], otokens, max_len)
 	if h5_file is not None:
 		with h5py.File(h5_file, 'w') as dfile:
 			dfile.create_dataset('X', data=X)
