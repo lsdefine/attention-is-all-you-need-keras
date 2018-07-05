@@ -11,13 +11,13 @@ from dataloader import TokenList, pad_to_longest
 class LayerNormalization(Layer):
 	def __init__(self, eps=1e-6, **kwargs):
 		self.eps = eps
-		super().__init__(**kwargs)
+		super(LayerNormalization, self).__init__(**kwargs)
 	def build(self, input_shape):
 		self.gamma = self.add_weight(name='gamma', shape=input_shape[-1:],
 									 initializer=Ones(), trainable=True)
 		self.beta = self.add_weight(name='beta', shape=input_shape[-1:],
 									initializer=Zeros(), trainable=True)
-		super().build(input_shape)
+		super(LayerNormalization, self).build(input_shape)
 	def call(self, x):
 		mean = K.mean(x, axis=-1, keepdims=True)
 		std = K.std(x, axis=-1, keepdims=True)
