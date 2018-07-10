@@ -1,2 +1,3 @@
 *.h5
 models/
+data/en2de_word.txt

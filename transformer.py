@@ -6,7 +6,10 @@ from keras.callbacks import *
 from keras.initializers import *
 import tensorflow as tf
 
-from dataloader import TokenList, pad_to_longest
+try:
+	from dataloader import TokenList, pad_to_longest
+	# for transformer
+except: pass
 
 class LayerNormalization(Layer):
 	def __init__(self, eps=1e-6, **kwargs):
@@ -41,7 +44,7 @@ class ScaledDotProductAttention():
 
 class MultiHeadAttention():
 	# mode 0 - big martixes, faster; mode 1 - more clear implementation
-	def __init__(self, n_head, d_model, d_k, d_v, dropout, mode=0):
+	def __init__(self, n_head, d_model, d_k, d_v, dropout, mode=0, use_norm=True):
 		self.mode = mode
 		self.n_head = n_head
 		self.d_k = d_k
@@ -60,7 +63,7 @@ class MultiHeadAttention():
 				self.ks_layers.append(TimeDistributed(Dense(d_k, use_bias=False)))
 				self.vs_layers.append(TimeDistributed(Dense(d_v, use_bias=False)))
 		self.attention = ScaledDotProductAttention(d_model)
-		self.layer_norm = LayerNormalization()
+		self.layer_norm = LayerNormalization() if use_norm else None
 		self.w_o = TimeDistributed(Dense(d_model))
 
 	def __call__(self, q, k, v, mask=None):
@@ -82,7 +85,8 @@ class MultiHeadAttention():
 			ks = Lambda(reshape1)(ks)
 			vs = Lambda(reshape1)(vs)
 
-			mask = Lambda(lambda x:K.repeat_elements(x, n_head, 0))(mask)
+			if mask is not None:
+				mask = Lambda(lambda x:K.repeat_elements(x, n_head, 0))(mask)
 			head, attn = self.attention(qs, ks, vs, mask=mask)  
 				
 			def reshape2(x):
@@ -100,11 +104,12 @@ class MultiHeadAttention():
 				vs = self.vs_layers[i](v) 
 				head, attn = self.attention(qs, ks, vs, mask)
 				heads.append(head); attns.append(attn)
-			head = Concatenate()(heads)
-			attn = Concatenate()(attns)
+			head = Concatenate()(heads) if n_head > 1 else heads[0]
+			attn = Concatenate()(attns) if n_head > 1 else attns[0]
 
 		outputs = self.w_o(head)
 		outputs = Dropout(self.dropout)(outputs)
+		if not self.layer_norm: return outputs, attn
 		outputs = Add()([outputs, q])
 		return self.layer_norm(outputs), attn
 
@@ -401,6 +406,64 @@ class LRSchedulerPerEpoch(Callback):
 		self.step_num += self.num_per_epoch
 		lr = self.basic * min(self.step_num**-0.5, self.step_num*self.warm)
 		K.set_value(self.model.optimizer.lr, lr)
+
+class AddPosEncoding:
+	def __call__(self, x):
+		_, max_len, d_emb = K.int_shape(x)
+		pos = GetPosEncodingMatrix(max_len, d_emb)
+		x = Lambda(lambda x:x+pos)(x)
+		return x
+	
+add_layer = Lambda(lambda x:x[0]+x[1], output_shape=lambda x:x[0])
+# use this because keras may get wrong shapes with Add()([])
+
+class QANet_ConvBlock:
+	def __init__(self, dim, n_conv=2, kernel_size=7, dropout=0.1):
+		self.convs = [SeparableConv1D(dim, kernel_size, activation='relu', padding='same') for _ in range(n_conv)]
+		self.norm = LayerNormalization()
+		self.dropout = Dropout(dropout)
+	def __call__(self, x):
+		for i in range(len(self.convs)):
+			z = self.norm(x)
+			if i % 2 == 0: z = self.dropout(z)
+			z = self.convs[i](z)
+			x = add_layer([x, z])
+		return x
+
+class QANet_Block:
+	def __init__(self, dim, n_head, n_conv, kernel_size, dropout=0.1, add_pos=True):
+		self.conv = QANet_ConvBlock(dim, n_conv=n_conv, kernel_size=kernel_size, dropout=dropout)
+		self.self_att = MultiHeadAttention(n_head=n_head, d_model=dim, 
+									 d_k=dim//n_head, d_v=dim//n_head, 
+									 dropout=dropout, use_norm=False)
+		self.feed_forward = PositionwiseFeedForward(dim, dim, dropout=dropout)
+		self.norm = LayerNormalization()
+		self.add_pos = add_pos
+	def __call__(self, x, mask):
+		if self.add_pos: x = AddPosEncoding()(x)
+		x = self.conv(x)
+		z = self.norm(x)
+		z, _ = self.self_att(z, z, z, mask)
+		x = add_layer([x, z])
+		z = self.norm(x)
+		z = self.feed_forward(z)
+		x = add_layer([x, z])
+		return x
+
+class QANet_Encoder:
+	def __init__(self, dim=128, n_head=8, n_conv=2, n_block=1, kernel_size=7, dropout=0.1, add_pos=True):
+		self.dim = dim
+		self.n_block = n_block
+		self.conv_first = SeparableConv1D(dim, 1, padding='same')
+		self.enc_block = QANet_Block(dim, n_head=n_head, n_conv=n_conv, kernel_size=kernel_size, 
+								dropout=dropout, add_pos=add_pos)
+	def __call__(self, x, mask):
+		if K.int_shape(x)[-1] != self.dim:
+			x = self.conv_first(x)
+		for i in range(self.n_block):
+			x = self.enc_block(x, mask)
+		return x
+
 
 if __name__ == '__main__':
 	itokens = TokenList(list('0123456789'))
