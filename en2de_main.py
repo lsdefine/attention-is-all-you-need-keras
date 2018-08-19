@@ -35,6 +35,15 @@ s2s.compile(Adam(0.001, 0.9, 0.98, epsilon=1e-9))
 s2s.model.summary()
 try: s2s.model.load_weights(mfile)
 except: print('\n\nnew model')
-s2s.model.fit([Xtrain, Ytrain], None, batch_size=64, epochs=30, \
+
+if 'test' in sys.argv:
+	print(s2s.decode_sequence_fast('A black dog eats food .'.split(), delimiter=' '))
+	while True:
+		quest = input('> ')
+		print(s2s.decode_sequence_fast(quest.split(), delimiter=' '))
+		rets = s2s.beam_search(quest.split(), delimiter=' ')
+		for x, y in rets: print(x, y)
+else:
+	s2s.model.fit([Xtrain, Ytrain], None, batch_size=64, epochs=30, \
 				validation_data=([Xvalid, Yvalid], None), \
 				callbacks=[lr_scheduler, model_saver])
