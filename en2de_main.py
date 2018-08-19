@@ -21,9 +21,9 @@ s2s.model.fit([Xtrain, Ytrain], None, batch_size=64, epochs=30, validation_data=
 
 from transformer import Transformer, LRSchedulerPerStep, LRSchedulerPerEpoch
 
-d_model = 256
+d_model = 512
 s2s = Transformer(itokens, otokens, len_limit=70, d_model=d_model, d_inner_hid=512, \
-				   n_head=4, d_k=64, d_v=64, layers=2, dropout=0.1)
+				   n_head=8, d_k=64, d_v=64, layers=2, dropout=0.1)
 
 mfile = 'models/en2de.model.h5'
 
