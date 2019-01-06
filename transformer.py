@@ -77,9 +77,9 @@ class MultiHeadAttention():
 
 			def reshape1(x):
 				s = tf.shape(x)   # [batch_size, len_q, n_head * d_k]
-				x = tf.reshape(x, [s[0], s[1], n_head, d_k])
+				x = tf.reshape(x, [s[0], s[1], n_head, s[2]//n_head])
 				x = tf.transpose(x, [2, 0, 1, 3])  
-				x = tf.reshape(x, [-1, s[1], d_k])  # [n_head * batch_size, len_q, d_k]
+				x = tf.reshape(x, [-1, s[1], s[2]//n_head])  # [n_head * batch_size, len_q, d_k]
 				return x
 			qs = Lambda(reshape1)(qs)
 			ks = Lambda(reshape1)(ks)
@@ -193,14 +193,14 @@ class Decoder():
 		self.pos_layer = pos_emb
 		self.layers = [DecoderLayer(d_model, d_inner_hid, n_head, d_k, d_v, dropout) for _ in range(layers)]
 	def __call__(self, tgt_seq, tgt_pos, src_seq, enc_output, return_att=False, active_layers=999):
-		dec = self.emb_layer(tgt_seq)
-		pos = self.pos_layer(tgt_pos)
-		x = Add()([dec, pos])
+		x = self.emb_layer(tgt_seq)
+		if tgt_pos is not None:
+			pos = self.pos_layer(tgt_pos)
+			x = Add()([x, pos])
 
 		self_pad_mask = Lambda(lambda x:GetPadMask(x, x))(tgt_seq)
 		self_sub_mask = Lambda(GetSubMask)(tgt_seq)
 		self_mask = Lambda(lambda x:K.minimum(x[0], x[1]))([self_pad_mask, self_sub_mask])
-		
 		enc_mask = Lambda(lambda x:GetPadMask(x[0], x[1]))([tgt_seq, src_seq])
 
 		if return_att: self_atts, enc_atts = [], []
@@ -466,42 +466,4 @@ class QANet_Encoder:
 
 
 if __name__ == '__main__':
-	itokens = TokenList(list('0123456789'))
-	otokens = TokenList(list('0123456789abcdefx'))
-
-	def GenSample():
-		x = random.randint(0, 99999)
-		y = hex(x);  x = str(x)
-		return x, y
-
-	X, Y = [], []
-	for _ in range(100000):
-		x, y = GenSample()
-		X.append(list(x))
-		Y.append(list(y))
-
-	X, Y = pad_to_longest(X, itokens), pad_to_longest(Y, otokens)
-	print(X.shape, Y.shape)
-
-	s2s = Transformer(itokens, otokens, 10, 15)
-	lr_scheduler = LRSchedulerPerStep(256, 4000)
-	s2s.compile('adam')
-	s2s.model.summary()
-
-	class TestCallback(Callback):
-		def on_epoch_end(self, epoch, logs = None):
-			print('\n')
-			for test in [123, 13245, 33467]:
-				ret = s2s.decode_sequence(str(test))
-				print(test, ret, hex(test))
-			print('\n')
-
-	TestCallback().on_epoch_end(1)
-
-	#s2s.model.load_weights('model.h5')
-	s2s.model.fit([X, Y], None, batch_size=256, epochs=40,
-					 validation_split=0.05, 
-					 callbacks=[TestCallback(), lr_scheduler])
-	s2s.model.save_weights('model.h5')
-
-
+	print('done')

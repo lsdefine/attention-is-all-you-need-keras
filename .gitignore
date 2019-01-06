@@ -3,3 +3,5 @@ models/
 data/en2de_word.txt
 data/pinyin.corpus.txt
 data/pinyin_word.txt
+univ_transformer.py
+hexconv_main.py
