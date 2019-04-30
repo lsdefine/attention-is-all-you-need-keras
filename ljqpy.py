@@ -1,6 +1,7 @@
-﻿# coding = utf-8
+# coding = utf-8
 
 import os, re, sys, random, urllib.parse
+from collections import defaultdict
 
 def WriteLine(fout, lst):
 	fout.write('\t'.join([str(x) for x in lst]) + '\n')
@@ -9,37 +10,40 @@ def RM(patt, sr):
 	mat = re.search(patt, sr, re.DOTALL | re.MULTILINE)
 	return mat.group(1) if mat else ''
 
-try:
-	import requests
+try: import requests
 except: pass
-def GetPage(url, cookie='', proxy=''):
+def GetPage(url, cookie='', proxy='', timeout=5):
 	try:
 		headers = {'User-Agent':'Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.90 Safari/537.36'}
 		if cookie != '': headers['cookie'] = cookie
 		if proxy != '': 
 			proxies = {'http': proxy, 'https': proxy}
-			resp = requests.get(url, headers=headers, proxies=proxies, timeout=5.0)
-		else:
-			resp = requests.get(url, headers=headers, timeout=5.0)
+			resp = requests.get(url, headers=headers, proxies=proxies, timeout=timeout)
+		else: resp = requests.get(url, headers=headers, timeout=timeout)
 		content = resp.content
-		headc = content[:min([3000,len(content)])].decode(errors='ignore')
-		charset = RM('charset="?([-a-zA-Z0-9]+)', headc)
-		if charset == '': charset = 'utf-8'
-		content = content.decode(charset, errors='replace')
+		try: 
+			import chardet
+			charset = chardet.detect(content).get('encoding','utf-8')
+			if charset.lower().startswith('gb'): charset = 'gbk'
+			content = content.decode(charset, errors='replace')
+		except:
+			headc = content[:min([3000,len(content)])].decode(errors='ignore')
+			charset = RM('charset="?([-a-zA-Z0-9]+)', headc)
+			if charset == '': charset = 'utf-8'
+			content = content.decode(charset, errors='replace')
 	except Exception as e:
 		print(e)
 		content = ''
 	return content
 
-def GetJson(url, cookie='', proxy=''):
+def GetJson(url, cookie='', proxy='', timeout=5.0):
 	try:
 		headers = {'User-Agent':'Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.90 Safari/537.36'}
 		if cookie != '': headers['cookie'] = cookie
 		if proxy != '': 
 			proxies = {'http': proxy, 'https': proxy}
-			resp = requests.get(url, headers=headers, proxies=proxies, timeout=5.0)
-		else:
-			resp = requests.get(url, headers=headers, timeout=5.0)
+			resp = requests.get(url, headers=headers, proxies=proxies, timeout=timeout)
+		else: resp = requests.get(url, headers=headers, timeout=timeout)
 		return resp.json() 
 	except Exception as e:
 		print(e)
@@ -147,14 +151,20 @@ def SplitTables(fn, limit=3):
 						fout.write(line)
 
 def LoadSet(fn):
-	with open(fn, encoding = "utf-8") as fin:
+	with open(fn, encoding="utf-8") as fin:
 		st = set(ll for ll in fin.read().split('\n') if ll != "")
 	return st
 
 def LoadList(fn):
-	with open(fn, encoding = "utf-8") as fin:
+	with open(fn, encoding="utf-8") as fin:
 		st = list(ll for ll in fin.read().split('\n') if ll != "")
 	return st
+
+def LoadListg(fn):
+	with open(fn, encoding="utf-8") as fin:
+		for ll in fin:
+			ll = ll.strip()
+			if ll != '': yield ll
 
 def LoadDict(fn, func=str):
 	dict = {}
@@ -174,6 +184,11 @@ def SaveList(st, ofn):
 		for k in st:
 			fout.write(str(k) + "\n")
 
+def ListDirFiles(dir, filter=None):
+	if filter is None: 
+		return [os.path.join(dir, x) for x in os.listdir(dir)]
+	return [os.path.join(dir, x) for x in os.listdir(dir) if filter(x)]
+
 def ProcessDir(dir, func, param):
 	for file in os.listdir(dir):
 		print(file)
@@ -185,7 +200,7 @@ def GetLines(fn):
 	return lines
 
 				
-def SortRows(file, fobj, cid, type = int, rev = True):
+def SortRows(file, fobj, cid, type=int, rev = True):
 	lines = LoadCSV(file)
 	dat = []
 	for dv in lines:
@@ -209,6 +224,40 @@ def SetProduct(file1, file2, fobj):
 			for z2 in l2:
 				fout.write(z1 + z2 + '\n')
 
+class TokenList:
+	def __init__(self, file, low_freq=2, source=None, func=None, save_low_freq=2, special_marks=[]):
+		if not os.path.exists(file):
+			tdict = defaultdict(int)
+			for i, xx in enumerate(special_marks): tdict[xx] = 100000000 - i
+			for xx in source:
+				for token in func(xx): tdict[token] += 1
+			tokens = FreqDict2List(tdict)
+			tokens = [x for x in tokens if x[1] >= save_low_freq]
+			SaveCSV(tokens, file)
+		self.id2t = ['<PAD>', '<UNK>'] + \
+			[x for x,y in LoadCSV(file) if float(y) >= low_freq]
+		self.t2id = {v:k for k,v in enumerate(self.id2t)}
+	def get_id(self, token): return self.t2id.get(token, 1)
+	def get_token(self, ii): return self.id2t[ii]
+	def get_num(self): return len(self.id2t)
+
+def CalcF1(correct, output, golden):
+	prec = correct / output;  reca = correct / golden;
+	f1 = 2 * prec * reca / (prec + reca)
+	pstr = 'Prec: %.4f %d/%d, Reca: %.4f %d/%d, F1: %.4f' % (prec, correct, output, reca, correct, golden, f1)
+	return pstr
+
+def Upgradeljqpy(url=None):
+	if url is None: url = 'http://gdm.fudan.edu.cn/files1/ljq/ljqpy.py'
+	dirs = [dir for dir in reversed(sys.path) if os.path.isdir(dir) and 'ljqpy.py' in os.listdir(dir)]
+	if len(dirs) == 0: raise Exception("package directory no found")
+	dir = dirs[0]
+	print('downloading ljqpy.py from %s to %s' % (url, dir))
+	resp = requests.get(url)
+	if b'Upgradeljqpy' not in resp.content: raise Exception('bad file')
+	with open(os.path.join(dir, 'ljqpy.py'), 'wb') as fout:
+		fout.write(resp.content)
+	print('success')
 
 def sql(cmd=''):
 	if cmd == '': cmd = input("> ")

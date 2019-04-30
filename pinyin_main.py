@@ -11,9 +11,8 @@ print('seq 2 words:', otokens.num())
 from transformer import Transformer, LRSchedulerPerStep
 
 d_model = 256  
-n_head = 4
 s2s = Transformer(itokens, otokens, len_limit=500, d_model=d_model, d_inner_hid=1024, \
-				   n_head=n_head, d_k=d_model//n_head, d_v=d_model//n_head, layers=3, dropout=0.1)
+				   n_head=4, layers=3, dropout=0.1)
 
 mfile = 'models/pinyin.model.h5'
 lr_scheduler = LRSchedulerPerStep(d_model, 4000) 

@@ -16,10 +16,8 @@ class LayerNormalization(Layer):
 		self.eps = eps
 		super(LayerNormalization, self).__init__(**kwargs)
 	def build(self, input_shape):
-		self.gamma = self.add_weight(name='gamma', shape=input_shape[-1:],
-									 initializer=Ones(), trainable=True)
-		self.beta = self.add_weight(name='beta', shape=input_shape[-1:],
-									initializer=Zeros(), trainable=True)
+		self.gamma = self.add_weight(name='gamma', shape=input_shape[-1:], initializer=Ones(), trainable=True)
+		self.beta = self.add_weight(name='beta', shape=input_shape[-1:], initializer=Zeros(), trainable=True)
 		super(LayerNormalization, self).build(input_shape)
 	def call(self, x):
 		mean = K.mean(x, axis=-1, keepdims=True)
@@ -28,14 +26,15 @@ class LayerNormalization(Layer):
 	def compute_output_shape(self, input_shape):
 		return input_shape
 
+# It's safe to use a 1-d mask for self-attention
 class ScaledDotProductAttention():
 	def __init__(self, d_model, attn_dropout=0.1):
 		self.temper = np.sqrt(d_model)
 		self.dropout = Dropout(attn_dropout)
-	def __call__(self, q, k, v, mask):
-		attn = Lambda(lambda x:K.batch_dot(x[0],x[1],axes=[2,2])/self.temper)([q, k])
+	def __call__(self, q, k, v, mask):   # mask_k or mask_qk
+		attn = Lambda(lambda x:K.batch_dot(x[0],x[1],axes=[2,2])/self.temper)([q, k])  # shape=(batch, q, k)
 		if mask is not None:
-			mmask = Lambda(lambda x:(-1e+10)*(1-x))(mask)
+			mmask = Lambda(lambda x:(-1e+9)*(1.-K.cast(x, 'float32')))(mask)
 			attn = Add()([attn, mmask])
 		attn = Activation('softmax')(attn)
 		attn = self.dropout(attn)
@@ -140,8 +139,9 @@ class DecoderLayer():
 		self.self_att_layer = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
 		self.enc_att_layer  = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
 		self.pos_ffn_layer  = PositionwiseFeedForward(d_model, d_inner_hid, dropout=dropout)
-	def __call__(self, dec_input, enc_output, self_mask=None, enc_mask=None):
-		output, slf_attn = self.self_att_layer(dec_input, dec_input, dec_input, mask=self_mask)
+	def __call__(self, dec_input, enc_output, self_mask=None, enc_mask=None, dec_last_state=None):
+		if dec_last_state is None: dec_last_state = dec_input
+		output, slf_attn = self.self_att_layer(dec_input, dec_last_state, dec_last_state, mask=self_mask)
 		output, enc_attn = self.enc_att_layer(output, enc_output, enc_output, mask=enc_mask)
 		output = self.pos_ffn_layer(output)
 		return output, slf_attn, enc_attn
@@ -157,54 +157,44 @@ def GetPosEncodingMatrix(max_len, d_emb):
 	return pos_enc
 
 def GetPadMask(q, k):
+	'''
+	shape: [B, Q, K]
+	'''
 	ones = K.expand_dims(K.ones_like(q, 'float32'), -1)
 	mask = K.cast(K.expand_dims(K.not_equal(k, 0), 1), 'float32')
 	mask = K.batch_dot(ones, mask, axes=[2,1])
 	return mask
 
 def GetSubMask(s):
+	'''
+	shape: [B, Q, K], lower triangle because the i-th row should have i 1s.
+	'''
 	len_s = tf.shape(s)[1]
 	bs = tf.shape(s)[:1]
 	mask = K.cumsum(tf.eye(len_s, batch_shape=bs), 1)
 	return mask
 
-class Encoder():
-	def __init__(self, d_model, d_inner_hid, n_head, d_k, d_v, \
-				layers=6, dropout=0.1, word_emb=None, pos_emb=None):
-		self.emb_layer = word_emb
-		self.pos_layer = pos_emb
-		self.emb_dropout = Dropout(dropout)
+class SelfAttention():
+	def __init__(self, d_model, d_inner_hid, n_head, d_k, d_v, layers=6, dropout=0.1):
 		self.layers = [EncoderLayer(d_model, d_inner_hid, n_head, d_k, d_v, dropout) for _ in range(layers)]
-	def __call__(self, src_seq, src_pos, return_att=False, active_layers=999):
-		x = self.emb_layer(src_seq)
-		if src_pos is not None:
-			pos = self.pos_layer(src_pos)
-			x = Add()([x, pos])
-		x = self.emb_dropout(x)
+	def __call__(self, src_emb, src_seq, return_att=False, active_layers=999):
 		if return_att: atts = []
-		mask = Lambda(lambda x:GetPadMask(x, x))(src_seq)
+		mask = Lambda(lambda x:K.cast(K.greater(x, 0), 'float32'))(src_seq)
+		x = src_emb		
 		for enc_layer in self.layers[:active_layers]:
 			x, att = enc_layer(x, mask)
 			if return_att: atts.append(att)
 		return (x, atts) if return_att else x
 
 class Decoder():
-	def __init__(self, d_model, d_inner_hid, n_head, d_k, d_v, \
-			  layers=6, dropout=0.1, word_emb=None, pos_emb=None):
-		self.emb_layer = word_emb
-		self.pos_layer = pos_emb
+	def __init__(self, d_model, d_inner_hid, n_head, d_k, d_v, layers=6, dropout=0.1):
 		self.layers = [DecoderLayer(d_model, d_inner_hid, n_head, d_k, d_v, dropout) for _ in range(layers)]
-	def __call__(self, tgt_seq, tgt_pos, src_seq, enc_output, return_att=False, active_layers=999):
-		x = self.emb_layer(tgt_seq)
-		if tgt_pos is not None:
-			pos = self.pos_layer(tgt_pos)
-			x = Add()([x, pos])
-
+	def __call__(self, tgt_emb, tgt_seq, src_seq, enc_output, return_att=False, active_layers=999):
+		x = tgt_emb
 		self_pad_mask = Lambda(lambda x:GetPadMask(x, x))(tgt_seq)
 		self_sub_mask = Lambda(GetSubMask)(tgt_seq)
 		self_mask = Lambda(lambda x:K.minimum(x[0], x[1]))([self_pad_mask, self_sub_mask])
 		enc_mask = Lambda(lambda x:GetPadMask(x[0], x[1]))([tgt_seq, src_seq])
-
 		if return_att: self_atts, enc_atts = [], []
 		for dec_layer in self.layers[:active_layers]:
 			x, self_att, enc_att = dec_layer(x, enc_output, self_mask, enc_mask)
@@ -213,9 +203,80 @@ class Decoder():
 				enc_atts.append(enc_att)
 		return (x, self_atts, enc_atts) if return_att else x
 
+
+class ReadoutDecoderCell(Layer):
+	def __init__(self, o_word_emb, pos_emb, decoder, target_layer, **kwargs):
+		self.o_word_emb = o_word_emb
+		self.pos_emb = pos_emb
+		self.decoder = decoder
+		self.target_layer = target_layer
+		super().__init__(**kwargs)
+	def call(self, inputs, states, constants, training=None):
+		tgt_curr_input, tgt_pos_input, dec_mask, dec_output = states[0], states[1], states[2], list(states[3:])
+		enc_output, enc_mask = constants
+
+		time = K.max(tgt_pos_input)
+		col_mask = K.cast(K.equal(K.cumsum(K.ones_like(dec_mask), axis=1), time), dtype='int32')
+		dec_mask = dec_mask + col_mask
+
+		tgt_emb = self.o_word_emb(tgt_curr_input)
+		if self.pos_emb: tgt_emb = tgt_emb + self.pos_emb(tgt_pos_input)
+
+		x = tgt_emb
+		xs = []
+		cc = K.cast(K.expand_dims(col_mask), dtype='float32')
+		for i, dec_layer in enumerate(self.decoder.layers):
+			dec_last_state = dec_output[i] * (1-cc) + tf.einsum('ijk,ilj->ilk', x, cc)
+			x, _, _ = dec_layer(x, enc_output, dec_mask, enc_mask, dec_last_state=dec_last_state)
+			xs.append(dec_last_state)
+
+		ff_output = self.target_layer(x)
+		out = K.cast(K.argmax(ff_output, -1), dtype='int32')
+		return out, [out, tgt_pos_input+1, dec_mask] + xs
+
+class InferRNN(Layer):
+	def __init__(self, cell, return_sequences=False, go_backwards=False, **kwargs):
+		if not hasattr(cell, 'call'):
+			raise ValueError('`cell` should have a `call` method. ' 'The RNN was passed:', cell)
+		super().__init__(**kwargs)
+		self.cell = cell
+		self.return_sequences = return_sequences
+		self.go_backwards = go_backwards
+
+	def compute_output_shape(self, input_shape):
+		return (input_shape[0], input_shape[1], 1) if self.return_sequences else (input_shape[0], 1)
+			
+	def __call__(self, inputs, initial_state=None, constants=None, **kwargs):
+		if initial_state is not None:
+			kwargs['initial_state'] = initial_state
+		if constants is not None:
+			kwargs['constants'] = constants
+			self._num_constants = len(constants)
+		return super().__call__(inputs, **kwargs)
+
+	def call(self, inputs, mask=None, training=None, initial_state=None, constants=None):
+		if isinstance(inputs, list):
+			if self._num_constants is None: initial_state = inputs[1:]
+			else: initial_state = inputs[1:-self._num_constants]
+			inputs = inputs[0]
+		input_shape = K.int_shape(inputs)
+		timesteps = input_shape[1]
+
+		kwargs = {}
+		def step(inputs, states):
+			constants = states[-self._num_constants:]
+			states = states[:-self._num_constants]
+			return self.cell.call(inputs, states, constants=constants, **kwargs)
+
+		last_output, outputs, states = K.rnn(step, inputs, initial_state, constants=constants,
+											 go_backwards=self.go_backwards,
+											 mask=mask, unroll=False, input_length=timesteps)
+		output = outputs if self.return_sequences else last_output
+		return output
+
 class Transformer:
 	def __init__(self, i_tokens, o_tokens, len_limit, d_model=256, \
-			  d_inner_hid=512, n_head=4, d_k=64, d_v=64, layers=2, dropout=0.1, \
+			  d_inner_hid=512, n_head=4, d_k=0, d_v=0, layers=2, dropout=0.1, \
 			  share_word_emb=False):
 		self.i_tokens = i_tokens
 		self.o_tokens = o_tokens
@@ -223,21 +284,26 @@ class Transformer:
 		self.src_loc_info = True
 		self.d_model = d_model
 		self.decode_model = None
+		self.readout_model = None
+		self.layers = layers
 		d_emb = d_model
 
-		pos_emb = Embedding(len_limit, d_emb, trainable=False, \
+		if d_k == 0 or d_v == 0: d_k = d_v = d_model // n_head
+		assert d_k * n_head == d_model and d_v == d_k
+
+		self.pos_emb = Embedding(len_limit, d_emb, trainable=False, \
 						   weights=[GetPosEncodingMatrix(len_limit, d_emb)])
 
-		i_word_emb = Embedding(i_tokens.num(), d_emb)
+		self.emb_dropout = Dropout(dropout)
+
+		self.i_word_emb = Embedding(i_tokens.num(), d_emb)
 		if share_word_emb: 
 			assert i_tokens.num() == o_tokens.num()
-			o_word_emb = i_word_emb
-		else: o_word_emb = Embedding(o_tokens.num(), d_emb)
+			self.o_word_emb = i_word_emb
+		else: self.o_word_emb = Embedding(o_tokens.num(), d_emb)
 
-		self.encoder = Encoder(d_model, d_inner_hid, n_head, d_k, d_v, layers, dropout, \
-							word_emb=i_word_emb, pos_emb=pos_emb)
-		self.decoder = Decoder(d_model, d_inner_hid, n_head, d_k, d_v, layers, dropout, \
-							word_emb=o_word_emb, pos_emb=pos_emb)
+		self.encoder = SelfAttention(d_model, d_inner_hid, n_head, d_k, d_v, layers, dropout)
+		self.decoder = Decoder(d_model, d_inner_hid, n_head, d_k, d_v, layers, dropout)
 		self.target_layer = TimeDistributed(Dense(o_tokens.num(), use_bias=False))
 
 	def get_pos_seq(self, x):
@@ -255,14 +321,20 @@ class Transformer:
 
 		src_pos = Lambda(self.get_pos_seq)(src_seq)
 		tgt_pos = Lambda(self.get_pos_seq)(tgt_seq)
-		if not self.src_loc_info: src_pos = None
 
-		enc_output = self.encoder(src_seq, src_pos, active_layers=active_layers)
-		dec_output = self.decoder(tgt_seq, tgt_pos, src_seq, enc_output, active_layers=active_layers)	
+		src_emb = self.i_word_emb(src_seq)
+		tgt_emb = self.o_word_emb(tgt_seq)
+
+		if self.src_loc_info: 
+			src_emb = add_layer([src_emb, self.pos_emb(src_pos)])
+			tgt_emb = add_layer([tgt_emb, self.pos_emb(tgt_pos)])
+		src_emb = self.emb_dropout(src_emb)
+
+		enc_output = self.encoder(src_emb, src_seq, active_layers=active_layers)
+		dec_output = self.decoder(tgt_emb, tgt_seq, src_seq, enc_output, active_layers=active_layers)	
 		final_output = self.target_layer(dec_output)
 
-		def get_loss(args):
-			y_pred, y_true = args
+		def get_loss(y_pred, y_true):
 			y_true = tf.cast(y_true, 'int32')
 			loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_true, logits=y_pred)
 			mask = tf.cast(tf.not_equal(y_true, 0), 'float32')
@@ -270,20 +342,18 @@ class Transformer:
 			loss = K.mean(loss)
 			return loss
 
-		def get_accu(args):
-			y_pred, y_true = args
+		def get_accu(y_pred, y_true):
 			mask = tf.cast(tf.not_equal(y_true, 0), 'float32')
 			corr = K.cast(K.equal(K.cast(y_true, 'int32'), K.cast(K.argmax(y_pred, axis=-1), 'int32')), 'float32')
 			corr = K.sum(corr * mask, -1) / K.sum(mask, -1)
 			return K.mean(corr)
 				
-		loss = Lambda(get_loss)([final_output, tgt_true])
-		self.ppl = Lambda(K.exp)(loss)
-		self.accu = Lambda(get_accu)([final_output, tgt_true])
+		loss = get_loss(final_output, tgt_true)
+		self.ppl = K.exp(loss)
+		self.accu = get_accu(final_output, tgt_true)
 
-		self.model = Model([src_seq_input, tgt_seq_input], loss)
+		self.model = Model([src_seq_input, tgt_seq_input], final_output)
 		self.model.add_loss([loss])
-		self.output_model = Model([src_seq_input, tgt_seq_input], final_output)
 		
 		self.model.compile(optimizer, None)
 		self.model.metrics_names.append('ppl')
@@ -304,13 +374,61 @@ class Transformer:
 		target_seq = np.zeros((1, self.len_limit), dtype='int32')
 		target_seq[0,0] = self.o_tokens.startid()
 		for i in range(self.len_limit-1):
-			output = self.output_model.predict_on_batch([src_seq, target_seq])
+			output = self.model.predict_on_batch([src_seq, target_seq])
 			sampled_index = np.argmax(output[0,i,:])
 			sampled_token = self.o_tokens.token(sampled_index)
 			decoded_tokens.append(sampled_token)
 			if sampled_index == self.o_tokens.endid(): break
 			target_seq[0,i+1] = sampled_index
 		return delimiter.join(decoded_tokens[:-1])
+
+	def make_readout_decode_model(self, max_output_len=32):
+		src_seq_input = Input(shape=(None,), dtype='int32')
+		tgt_start_input = Input(shape=(1,), dtype='int32')
+		src_seq = src_seq_input
+		enc_mask = Lambda(lambda x:K.cast(K.greater(x, 0), 'float32'))(src_seq)
+		src_emb = self.i_word_emb(src_seq)
+		if self.src_loc_info: 
+			src_pos = Lambda(self.get_pos_seq)(src_seq)
+			src_emb = add_layer([src_emb, self.pos_emb(src_pos)])
+		src_emb = self.emb_dropout(src_emb)
+		enc_output = self.encoder(src_emb, src_seq)
+
+		tgt_emb = self.o_word_emb(tgt_start_input)
+		tgt_seq = Lambda(lambda x:K.repeat_elements(x, max_output_len, 1))(tgt_start_input)
+		rep_input = Lambda(lambda x:K.repeat_elements(x, max_output_len, 1))(tgt_emb)
+	
+		cell = ReadoutDecoderCell(self.o_word_emb, self.pos_emb if self.src_loc_info else None, self.decoder, self.target_layer)
+		final_output = InferRNN(cell, return_sequences=True)(rep_input, 
+				initial_state=[tgt_start_input, K.ones_like(tgt_start_input), K.zeros_like(tgt_seq)] + [rep_input for _ in range(self.layers)], 
+				constants=[enc_output, enc_mask])
+		final_output = Lambda(lambda x:K.squeeze(x, -1))(final_output)
+		self.readout_model = Model([src_seq_input, tgt_start_input], final_output)
+
+	def decode_sequence_greedy(self, X, batch_size=32, max_output_len=64):
+		if self.readout_model is None: self.make_readout_decode_model(max_output_len)
+		target_seq = np.zeros((X.shape[0], 1), dtype='int32')
+		target_seq[0,:] = self.o_tokens.startid()
+		ret = self.readout_model.predict([X, target_seq], batch_size=batch_size, verbose=1)
+		return ret
+
+	def generate_sentence(self, rets, delimiter=''):
+		sents = []
+		for x in rets:
+			end_pos = min([i for i, z in enumerate(x) if z == self.o_tokens.endid()]+[len(x)])
+			rsent = [*map(self.o_tokens.token, x)][:end_pos]
+			sents.append(delimiter.join(rsent))
+		return sents
+
+	def decode_sequence_readout(self, input_seq, delimiter=''):
+		if self.readout_model is None: self.make_readout_decode_model()
+		src_seq = self.make_src_seq_matrix(input_seq)
+		target_seq = np.zeros((1,1), dtype='int32')
+		target_seq[0,0] = self.o_tokens.startid()
+		ret = self.readout_model.predict_on_batch([src_seq, target_seq])[0]
+		end_pos = min([i for i, z in enumerate(ret) if z == self.o_tokens.endid()]+[len(ret)])
+		rsent = [*map(self.o_tokens.token, ret)][:end_pos]
+		return delimiter.join(rsent)
 
 	def make_fast_decode_model(self):
 		src_seq_input = Input(shape=(None,), dtype='int32')
@@ -320,17 +438,23 @@ class Transformer:
 
 		src_pos = Lambda(self.get_pos_seq)(src_seq)
 		tgt_pos = Lambda(self.get_pos_seq)(tgt_seq)
-		if not self.src_loc_info: src_pos = None
-		enc_output = self.encoder(src_seq, src_pos)
+
+		src_emb = self.i_word_emb(src_seq)
+		tgt_emb = self.o_word_emb(tgt_seq)
+
+		if self.src_loc_info: 
+			src_emb = add_layer([src_emb, self.pos_emb(src_pos)])
+			tgt_emb = add_layer([tgt_emb, self.pos_emb(tgt_pos)])
+		src_emb = self.emb_dropout(src_emb)
+
+		enc_output = self.encoder(src_emb, src_seq)
 		self.encode_model = Model(src_seq_input, enc_output)
 
 		enc_ret_input = Input(shape=(None, self.d_model))
-		dec_output = self.decoder(tgt_seq, tgt_pos, src_seq, enc_ret_input)	
+		dec_output = self.decoder(tgt_emb, tgt_seq, src_seq, enc_ret_input)	
 		final_output = self.target_layer(dec_output)
 		self.decode_model = Model([src_seq_input, enc_ret_input, tgt_seq_input], final_output)
 		
-		self.encode_model.compile('adam', 'mse')
-		self.decode_model.compile('adam', 'mse')
 
 	def decode_sequence_fast(self, input_seq, delimiter=''):
 		if self.decode_model is None: self.make_fast_decode_model()
@@ -396,16 +520,6 @@ class LRSchedulerPerStep(Callback):
 		self.step_num = 0
 	def on_batch_begin(self, batch, logs = None):
 		self.step_num += 1
-		lr = self.basic * min(self.step_num**-0.5, self.step_num*self.warm)
-		K.set_value(self.model.optimizer.lr, lr)
-class LRSchedulerPerEpoch(Callback):
-	def __init__(self, d_model, warmup=4000, num_per_epoch=1000):
-		self.basic = d_model**-0.5
-		self.warm = warmup**-1.5
-		self.num_per_epoch = num_per_epoch
-		self.step_num = 1
-	def on_epoch_begin(self, epoch, logs = None):
-		self.step_num += self.num_per_epoch
 		lr = self.basic * min(self.step_num**-0.5, self.step_num*self.warm)
 		K.set_value(self.model.optimizer.lr, lr)
 
