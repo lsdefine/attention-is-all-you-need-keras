@@ -17,7 +17,9 @@ If using smaller model parameters, such as *layers=2* and *d_model=256*, the val
 ### Upgrades 
 Reconstruct some classes. 
 It is more easier to use the components in other models, just import transformer.py
+
 Add fast in-graph greedy predictions.
+
 TODO: in-graph beam search.
 
 # Acknowledgement
