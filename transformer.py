@@ -175,7 +175,8 @@ def GetSubMask(s):
 	return mask
 
 class SelfAttention():
-	def __init__(self, d_model, d_inner_hid, n_head, d_k, d_v, layers=6, dropout=0.1):
+	def __init__(self, d_model, d_inner_hid, n_head, d_k=0, d_v=0, layers=6, dropout=0.1):
+		if d_k == 0 or d_v == 0: d_k = d_v = d_model // n_head
 		self.layers = [EncoderLayer(d_model, d_inner_hid, n_head, d_k, d_v, dropout) for _ in range(layers)]
 	def __call__(self, src_emb, src_seq, return_att=False, active_layers=999):
 		if return_att: atts = []
@@ -187,7 +188,8 @@ class SelfAttention():
 		return (x, atts) if return_att else x
 
 class Decoder():
-	def __init__(self, d_model, d_inner_hid, n_head, d_k, d_v, layers=6, dropout=0.1):
+	def __init__(self, d_model, d_inner_hid, n_head, d_k=0, d_v=0, layers=6, dropout=0.1):
+		if d_k == 0 or d_v == 0: d_k = d_v = d_model // n_head
 		self.layers = [DecoderLayer(d_model, d_inner_hid, n_head, d_k, d_v, dropout) for _ in range(layers)]
 	def __call__(self, tgt_emb, tgt_seq, src_seq, enc_output, return_att=False, active_layers=999):
 		x = tgt_emb
