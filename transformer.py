@@ -402,7 +402,8 @@ class Transformer:
 	
 		cell = ReadoutDecoderCell(self.o_word_emb, self.pos_emb if self.src_loc_info else None, self.decoder, self.target_layer)
 		final_output = InferRNN(cell, return_sequences=True)(rep_input, 
-				initial_state=[tgt_start_input, K.ones_like(tgt_start_input), K.zeros_like(tgt_seq)] + [rep_input for _ in range(self.layers)], 
+				initial_state=[tgt_start_input, K.ones_like(tgt_start_input), K.zeros_like(tgt_seq)] + \
+						[rep_input for _ in self.decoder.layers], 
 				constants=[enc_output, enc_mask])
 		final_output = Lambda(lambda x:K.squeeze(x, -1))(final_output)
 		self.readout_model = Model([src_seq_input, tgt_start_input], final_output)
@@ -410,7 +411,7 @@ class Transformer:
 	def decode_sequence_greedy(self, X, batch_size=32, max_output_len=64):
 		if self.readout_model is None: self.make_readout_decode_model(max_output_len)
 		target_seq = np.zeros((X.shape[0], 1), dtype='int32')
-		target_seq[0,:] = self.o_tokens.startid()
+		target_seq[:,0] = self.o_tokens.startid()
 		ret = self.readout_model.predict([X, target_seq], batch_size=batch_size, verbose=1)
 		return ret
 
@@ -426,7 +427,7 @@ class Transformer:
 		if self.readout_model is None: self.make_readout_decode_model()
 		src_seq = self.make_src_seq_matrix(input_seq)
 		target_seq = np.zeros((1,1), dtype='int32')
-		target_seq[0,0] = self.o_tokens.startid()
+		target_seq[:,0] = self.o_tokens.startid()
 		ret = self.readout_model.predict_on_batch([src_seq, target_seq])[0]
 		end_pos = min([i for i, z in enumerate(ret) if z == self.o_tokens.endid()]+[len(ret)])
 		rsent = [*map(self.o_tokens.token, ret)][:end_pos]
