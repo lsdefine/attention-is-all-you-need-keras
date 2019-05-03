@@ -17,7 +17,7 @@ If using smaller model parameters, such as *layers=2* and *d_model=256*, the val
 ### Upgrades 
 - Reconstruct some classes. 
 - It is more easier to use the components in other models, just import transformer.py
-- A fast step-by-step decoder is added, including a upgraded beam-search. But they should be modified to be reuseable.
+- A fast step-by-step decoder is added, including an upgraded beam-search. But they should be modified to be reuseable.
 
 # Acknowledgement
 - Some model structures and some scripts are borrowed from [jadore801120/attention-is-all-you-need-pytorch](https://github.com/jadore801120/attention-is-all-you-need-pytorch).
