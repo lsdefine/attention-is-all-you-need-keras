@@ -35,8 +35,9 @@ try: s2s.model.load_weights(mfile)
 except: print('\n\nnew model')
 
 if 'eval' in sys.argv:
+	for x, y in s2s.beam_search('A black dog eats food .'.split(), delimiter=' '):
+		print(x, y)
 	print(s2s.decode_sequence_readout('A black dog eats food .'.split(), delimiter=' '))
-	print(s2s.decode_sequence('A black dog eats food .'.split(), delimiter=' '))
 	print(s2s.decode_sequence_fast('A black dog eats food .'.split(), delimiter=' '))
 	while True:
 		quest = input('> ')
@@ -44,9 +45,20 @@ if 'eval' in sys.argv:
 		rets = s2s.beam_search(quest.split(), delimiter=' ')
 		for x, y in rets: print(x, y)
 elif 'test' in sys.argv:
-	rets = s2s.decode_sequence_greedy(Xvalid[:256])
-	sents = s2s.generate_sentence(rets, delimiter=' ')
-	for x in sents: print(x)
+	import ljqpy
+	valids = ljqpy.LoadCSV('data/en2de.s2s.valid.txt')
+	en = [x[0].split() for x in valids[:100]]
+	rets = s2s.decode_sequence_readout(en, delimiter=' ')
+	for x in rets[:5]: print(x)
+
+	rets = s2s.beam_search(en, delimiter=' ', verbose=1)
+	for i, x in enumerate(rets[:5]):
+		print('-'*20)
+		print(valids[i][1])
+		for y in x: print(y)
+
+	rets = s2s.decode_sequence_fast(en, delimiter=' ', verbose=1)
+	for x in rets[:5]: print(x)
 else:
 	s2s.model.summary()
 	s2s.model.fit([Xtrain, Ytrain], None, batch_size=64, epochs=30, \

@@ -15,12 +15,9 @@ If using smaller model parameters, such as *layers=2* and *d_model=256*, the val
 - In *pinyin_main.py*, I tried another method to train the deep network. I train the first layer and the embedding layer first, then train a 2-layers model, and then train a 3-layers, etc. It works in this task.
 
 ### Upgrades 
-Reconstruct some classes. 
-It is more easier to use the components in other models, just import transformer.py
-
-Add fast in-graph greedy predictions.
-
-TODO: in-graph beam search.
+- Reconstruct some classes. 
+- It is more easier to use the components in other models, just import transformer.py
+- A fast step-by-step decoder is added, including a upgraded beam-search. But they should be modified to be reuseable.
 
 # Acknowledgement
 - Some model structures and some scripts are borrowed from [jadore801120/attention-is-all-you-need-pytorch](https://github.com/jadore801120/attention-is-all-you-need-pytorch).

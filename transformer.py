@@ -7,6 +7,7 @@ from keras.initializers import *
 import tensorflow as tf
 
 try:
+	from tqdm import tqdm
 	from dataloader import TokenList, pad_to_longest
 	# for transformer
 except: pass
@@ -28,11 +29,11 @@ class LayerNormalization(Layer):
 
 # It's safe to use a 1-d mask for self-attention
 class ScaledDotProductAttention():
-	def __init__(self, d_model, attn_dropout=0.1):
-		self.temper = np.sqrt(d_model)
+	def __init__(self, attn_dropout=0.1):
 		self.dropout = Dropout(attn_dropout)
 	def __call__(self, q, k, v, mask):   # mask_k or mask_qk
-		attn = Lambda(lambda x:K.batch_dot(x[0],x[1],axes=[2,2])/self.temper)([q, k])  # shape=(batch, q, k)
+		temper = tf.sqrt(tf.cast(tf.shape(k)[-1], dtype='float32'))
+		attn = Lambda(lambda x:K.batch_dot(x[0],x[1],axes=[2,2])/temper)([q, k])  # shape=(batch, q, k)
 		if mask is not None:
 			mmask = Lambda(lambda x:(-1e+9)*(1.-K.cast(x, 'float32')))(mask)
 			attn = Add()([attn, mmask])
@@ -43,11 +44,10 @@ class ScaledDotProductAttention():
 
 class MultiHeadAttention():
 	# mode 0 - big martixes, faster; mode 1 - more clear implementation
-	def __init__(self, n_head, d_model, d_k, d_v, dropout, mode=0, use_norm=True):
+	def __init__(self, n_head, d_model, dropout, mode=0):
 		self.mode = mode
 		self.n_head = n_head
-		self.d_k = d_k
-		self.d_v = d_v
+		self.d_k = self.d_v = d_k = d_v = d_model // n_head
 		self.dropout = dropout
 		if mode == 0:
 			self.qs_layer = Dense(n_head*d_k, use_bias=False)
@@ -61,8 +61,7 @@ class MultiHeadAttention():
 				self.qs_layers.append(TimeDistributed(Dense(d_k, use_bias=False)))
 				self.ks_layers.append(TimeDistributed(Dense(d_k, use_bias=False)))
 				self.vs_layers.append(TimeDistributed(Dense(d_v, use_bias=False)))
-		self.attention = ScaledDotProductAttention(d_model)
-		self.layer_norm = LayerNormalization() if use_norm else None
+		self.attention = ScaledDotProductAttention()
 		self.w_o = TimeDistributed(Dense(d_model))
 
 	def __call__(self, q, k, v, mask=None):
@@ -108,9 +107,7 @@ class MultiHeadAttention():
 
 		outputs = self.w_o(head)
 		outputs = Dropout(self.dropout)(outputs)
-		if not self.layer_norm: return outputs, attn
-		outputs = Add()([outputs, q])
-		return self.layer_norm(outputs), attn
+		return outputs, attn
 
 class PositionwiseFeedForward():
 	def __init__(self, d_hid, d_inner_hid, dropout=0.1):
@@ -126,24 +123,30 @@ class PositionwiseFeedForward():
 		return self.layer_norm(output)
 
 class EncoderLayer():
-	def __init__(self, d_model, d_inner_hid, n_head, d_k, d_v, dropout=0.1):
-		self.self_att_layer = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
+	def __init__(self, d_model, d_inner_hid, n_head, dropout=0.1):
+		self.self_att_layer = MultiHeadAttention(n_head, d_model, dropout=dropout)
 		self.pos_ffn_layer  = PositionwiseFeedForward(d_model, d_inner_hid, dropout=dropout)
+		self.norm_layer = LayerNormalization()
 	def __call__(self, enc_input, mask=None):
 		output, slf_attn = self.self_att_layer(enc_input, enc_input, enc_input, mask=mask)
+		output = self.norm_layer(Add()([enc_input, output]))
 		output = self.pos_ffn_layer(output)
 		return output, slf_attn
 
 class DecoderLayer():
-	def __init__(self, d_model, d_inner_hid, n_head, d_k, d_v, dropout=0.1):
-		self.self_att_layer = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
-		self.enc_att_layer  = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
+	def __init__(self, d_model, d_inner_hid, n_head, dropout=0.1):
+		self.self_att_layer = MultiHeadAttention(n_head, d_model, dropout=dropout)
+		self.enc_att_layer  = MultiHeadAttention(n_head, d_model, dropout=dropout)
 		self.pos_ffn_layer  = PositionwiseFeedForward(d_model, d_inner_hid, dropout=dropout)
+		self.norm_layer1 = LayerNormalization()
+		self.norm_layer2 = LayerNormalization()
 	def __call__(self, dec_input, enc_output, self_mask=None, enc_mask=None, dec_last_state=None):
 		if dec_last_state is None: dec_last_state = dec_input
 		output, slf_attn = self.self_att_layer(dec_input, dec_last_state, dec_last_state, mask=self_mask)
-		output, enc_attn = self.enc_att_layer(output, enc_output, enc_output, mask=enc_mask)
-		output = self.pos_ffn_layer(output)
+		x = self.norm_layer1(Add()([dec_input, output]))
+		output, enc_attn = self.enc_att_layer(x, enc_output, enc_output, mask=enc_mask)
+		x = self.norm_layer2(Add()([x, output]))
+		output = self.pos_ffn_layer(x)
 		return output, slf_attn, enc_attn
 
 def GetPosEncodingMatrix(max_len, d_emb):
@@ -175,9 +178,8 @@ def GetSubMask(s):
 	return mask
 
 class SelfAttention():
-	def __init__(self, d_model, d_inner_hid, n_head, d_k=0, d_v=0, layers=6, dropout=0.1):
-		if d_k == 0 or d_v == 0: d_k = d_v = d_model // n_head
-		self.layers = [EncoderLayer(d_model, d_inner_hid, n_head, d_k, d_v, dropout) for _ in range(layers)]
+	def __init__(self, d_model, d_inner_hid, n_head, layers=6, dropout=0.1):
+		self.layers = [EncoderLayer(d_model, d_inner_hid, n_head, dropout) for _ in range(layers)]
 	def __call__(self, src_emb, src_seq, return_att=False, active_layers=999):
 		if return_att: atts = []
 		mask = Lambda(lambda x:K.cast(K.greater(x, 0), 'float32'))(src_seq)
@@ -188,9 +190,8 @@ class SelfAttention():
 		return (x, atts) if return_att else x
 
 class Decoder():
-	def __init__(self, d_model, d_inner_hid, n_head, d_k=0, d_v=0, layers=6, dropout=0.1):
-		if d_k == 0 or d_v == 0: d_k = d_v = d_model // n_head
-		self.layers = [DecoderLayer(d_model, d_inner_hid, n_head, d_k, d_v, dropout) for _ in range(layers)]
+	def __init__(self, d_model, d_inner_hid, n_head, layers=6, dropout=0.1):
+		self.layers = [DecoderLayer(d_model, d_inner_hid, n_head, dropout) for _ in range(layers)]
 	def __call__(self, tgt_emb, tgt_seq, src_seq, enc_output, return_att=False, active_layers=999):
 		x = tgt_emb
 		self_pad_mask = Lambda(lambda x:GetPadMask(x, x))(tgt_seq)
@@ -205,6 +206,23 @@ class Decoder():
 				enc_atts.append(enc_att)
 		return (x, self_atts, enc_atts) if return_att else x
 
+class DecoderPerStep(Layer):
+	def __init__(self, decoder):
+		super().__init__()
+		self.layers = decoder.layers
+	def call(self, inputs):
+		(x, src_seq, enc_output), tgt_embs = inputs[:3], inputs[3:]
+		enc_mask = K.cast(K.greater(src_seq, 0), 'float32')
+		llen = tf.shape(tgt_embs[0])[1]
+		col_mask = K.cast(K.equal(K.cumsum(K.ones_like(tgt_embs[0], dtype='int32'), axis=1), llen), dtype='float32')
+		rs = [x]
+		for i, dec_layer in enumerate(self.layers):
+			tgt_emb = tgt_embs[i] + x * col_mask
+			x, _, _ = dec_layer(x, enc_output, enc_mask=enc_mask, dec_last_state=tgt_emb)
+			rs.append(x)
+		return rs
+	def compute_output_shape(self, ishape):
+		return [ishape[0] for _ in range(len(self.layers)+1)]
 
 class ReadoutDecoderCell(Layer):
 	def __init__(self, o_word_emb, pos_emb, decoder, target_layer, **kwargs):
@@ -214,7 +232,7 @@ class ReadoutDecoderCell(Layer):
 		self.target_layer = target_layer
 		super().__init__(**kwargs)
 	def call(self, inputs, states, constants, training=None):
-		tgt_curr_input, tgt_pos_input, dec_mask, dec_output = states[0], states[1], states[2], list(states[3:])
+		(tgt_curr_input, tgt_pos_input, dec_mask), dec_output = states[:3], list(states[3:])
 		enc_output, enc_mask = constants
 
 		time = K.max(tgt_pos_input)
@@ -278,7 +296,7 @@ class InferRNN(Layer):
 
 class Transformer:
 	def __init__(self, i_tokens, o_tokens, len_limit, d_model=256, \
-			  d_inner_hid=512, n_head=4, d_k=0, d_v=0, layers=2, dropout=0.1, \
+			  d_inner_hid=512, n_head=4, layers=2, dropout=0.1, \
 			  share_word_emb=False):
 		self.i_tokens = i_tokens
 		self.o_tokens = o_tokens
@@ -290,7 +308,7 @@ class Transformer:
 		self.layers = layers
 		d_emb = d_model
 
-		if d_k == 0 or d_v == 0: d_k = d_v = d_model // n_head
+		d_k = d_v = d_model // n_head
 		assert d_k * n_head == d_model and d_v == d_k
 
 		self.pos_emb = Embedding(len_limit, d_emb, trainable=False, \
@@ -304,8 +322,8 @@ class Transformer:
 			self.o_word_emb = i_word_emb
 		else: self.o_word_emb = Embedding(o_tokens.num(), d_emb)
 
-		self.encoder = SelfAttention(d_model, d_inner_hid, n_head, d_k, d_v, layers, dropout)
-		self.decoder = Decoder(d_model, d_inner_hid, n_head, d_k, d_v, layers, dropout)
+		self.encoder = SelfAttention(d_model, d_inner_hid, n_head, layers, dropout)
+		self.decoder = Decoder(d_model, d_inner_hid, n_head, layers, dropout)
 		self.target_layer = TimeDistributed(Dense(o_tokens.num(), use_bias=False))
 
 	def get_pos_seq(self, x):
@@ -363,27 +381,17 @@ class Transformer:
 		self.model.metrics_names.append('accu')
 		self.model.metrics_tensors.append(self.accu)
 
-	def make_src_seq_matrix(self, input_seq):
-		src_seq = np.zeros((1, len(input_seq)+3), dtype='int32')
-		src_seq[0,0] = self.i_tokens.startid()
-		for i, z in enumerate(input_seq): src_seq[0,1+i] = self.i_tokens.id(z)
-		src_seq[0,len(input_seq)+1] = self.i_tokens.endid()
+	def make_src_seq_matrix(self, input_seqs):
+		if type(input_seqs[0]) == type(''): input_seqs = [input_seqs]
+		maxlen = max(map(len, input_seqs))
+		src_seq = np.zeros((len(input_seqs), maxlen+3), dtype='int32')
+		src_seq[:,0] = self.i_tokens.startid()
+		for i, seq in enumerate(input_seqs):
+			for ii, z in enumerate(seq):
+				src_seq[i,1+ii] = self.i_tokens.id(z)
+			src_seq[i,1+len(seq)] = self.i_tokens.endid()
 		return src_seq
-
-	def decode_sequence(self, input_seq, delimiter=''):
-		src_seq = self.make_src_seq_matrix(input_seq)
-		decoded_tokens = []
-		target_seq = np.zeros((1, self.len_limit), dtype='int32')
-		target_seq[0,0] = self.o_tokens.startid()
-		for i in range(self.len_limit-1):
-			output = self.model.predict_on_batch([src_seq, target_seq])
-			sampled_index = np.argmax(output[0,i,:])
-			sampled_token = self.o_tokens.token(sampled_index)
-			decoded_tokens.append(sampled_token)
-			if sampled_index == self.o_tokens.endid(): break
-			target_seq[0,i+1] = sampled_index
-		return delimiter.join(decoded_tokens[:-1])
-
+	
 	def make_readout_decode_model(self, max_output_len=32):
 		src_seq_input = Input(shape=(None,), dtype='int32')
 		tgt_start_input = Input(shape=(1,), dtype='int32')
@@ -407,8 +415,8 @@ class Transformer:
 				constants=[enc_output, enc_mask])
 		final_output = Lambda(lambda x:K.squeeze(x, -1))(final_output)
 		self.readout_model = Model([src_seq_input, tgt_start_input], final_output)
-
-	def decode_sequence_greedy(self, X, batch_size=32, max_output_len=64):
+		
+	def decode_sequence_readout_x(self, X, batch_size=32, max_output_len=64):
 		if self.readout_model is None: self.make_readout_decode_model(max_output_len)
 		target_seq = np.zeros((X.shape[0], 1), dtype='int32')
 		target_seq[:,0] = self.o_tokens.startid()
@@ -423,98 +431,165 @@ class Transformer:
 			sents.append(delimiter.join(rsent))
 		return sents
 
-	def decode_sequence_readout(self, input_seq, delimiter=''):
+	def decode_sequence_readout(self, input_seqs, delimiter=''):
 		if self.readout_model is None: self.make_readout_decode_model()
-		src_seq = self.make_src_seq_matrix(input_seq)
-		target_seq = np.zeros((1,1), dtype='int32')
+		src_seq = self.make_src_seq_matrix(input_seqs)
+		target_seq = np.zeros((src_seq.shape[0],1), dtype='int32')
 		target_seq[:,0] = self.o_tokens.startid()
-		ret = self.readout_model.predict_on_batch([src_seq, target_seq])[0]
-		end_pos = min([i for i, z in enumerate(ret) if z == self.o_tokens.endid()]+[len(ret)])
-		rsent = [*map(self.o_tokens.token, ret)][:end_pos]
-		return delimiter.join(rsent)
+		rets = self.readout_model.predict([src_seq, target_seq])
+		rets = self.generate_sentence(rets, delimiter)
+		if type(input_seqs[0]) is type('') and len(rets) == 1: rets = rets[0]
+		return rets
 
 	def make_fast_decode_model(self):
 		src_seq_input = Input(shape=(None,), dtype='int32')
-		tgt_seq_input = Input(shape=(None,), dtype='int32')
-		src_seq = src_seq_input
-		tgt_seq = tgt_seq_input
-
-		src_pos = Lambda(self.get_pos_seq)(src_seq)
-		tgt_pos = Lambda(self.get_pos_seq)(tgt_seq)
-
-		src_emb = self.i_word_emb(src_seq)
-		tgt_emb = self.o_word_emb(tgt_seq)
-
+		src_pos = Lambda(self.get_pos_seq)(src_seq_input)
+		src_emb = self.i_word_emb(src_seq_input)
 		if self.src_loc_info: 
 			src_emb = add_layer([src_emb, self.pos_emb(src_pos)])
-			tgt_emb = add_layer([tgt_emb, self.pos_emb(tgt_pos)])
 		src_emb = self.emb_dropout(src_emb)
-
-		enc_output = self.encoder(src_emb, src_seq)
+		enc_output = self.encoder(src_emb, src_seq_input)
 		self.encode_model = Model(src_seq_input, enc_output)
 
+		self.decoder_pre_step = DecoderPerStep(self.decoder)
+		
+		src_seq_input = Input(shape=(None,), dtype='int32')
+		tgt_one_input = Input(shape=(1,), dtype='int32')
 		enc_ret_input = Input(shape=(None, self.d_model))
-		dec_output = self.decoder(tgt_emb, tgt_seq, src_seq, enc_ret_input)	
-		final_output = self.target_layer(dec_output)
-		self.decode_model = Model([src_seq_input, enc_ret_input, tgt_seq_input], final_output)
+		dec_ret_inputs = [Input(shape=(None, self.d_model)) for _ in self.decoder.layers]
+		tgt_pos = Lambda(lambda x:tf.shape(x)[1])(dec_ret_inputs[0])
+
+		tgt_one = self.o_word_emb(tgt_one_input)
+		if self.src_loc_info: 
+			tgt_one = add_layer([tgt_one, self.pos_emb(tgt_pos)])
+
+		dec_outputs = self.decoder_pre_step([tgt_one, src_seq_input, enc_ret_input]+dec_ret_inputs)	
+		final_output = self.target_layer(dec_outputs[-1])
+
+		self.decode_model = Model([tgt_one_input, src_seq_input, enc_ret_input]+dec_ret_inputs, 
+							dec_outputs[:-1]+[final_output])
 		
 
-	def decode_sequence_fast(self, input_seq, delimiter=''):
+	def decode_sequence_fast(self, input_seqs, batch_size=32, delimiter='', verbose=0):
 		if self.decode_model is None: self.make_fast_decode_model()
-		src_seq = self.make_src_seq_matrix(input_seq)
-		enc_ret = self.encode_model.predict_on_batch(src_seq)
+		src_seq = self.make_src_seq_matrix(input_seqs)
 
-		decoded_tokens = []
-		target_seq = np.zeros((1, self.len_limit), dtype='int32')
-		target_seq[0,0] = self.o_tokens.startid()
-		for i in range(self.len_limit-1):
-			output = self.decode_model.predict_on_batch([src_seq,enc_ret,target_seq])
-			sampled_index = np.argmax(output[0,i,:])
-			sampled_token = self.o_tokens.token(sampled_index)
-			decoded_tokens.append(sampled_token)
-			if sampled_index == self.o_tokens.endid(): break
-			target_seq[0,i+1] = sampled_index
-		return delimiter.join(decoded_tokens[:-1])
+		start_mark, end_mark = self.o_tokens.startid(), self.o_tokens.endid()
+		max_len = self.len_limit
+		def decode_batch(src_seq):
+			enc_ret = self.encode_model.predict_on_batch(src_seq)
+			bs = src_seq.shape[0]
+			target_one = np.zeros((bs, 1), dtype='int32')
+			target_one[:,0] = start_mark
+			d_model = self.decode_model.inputs[-1].shape[-1]
+			dec_outputs = [np.zeros((bs, 1, d_model)) for _ in self.decoder.layers]
+			ended = [0 for x in range(bs)]
+			decoded_indexes = [[] for x in range(bs)]
+			for i in range(max_len-1):
+				outputs = self.decode_model.predict_on_batch([target_one, src_seq, enc_ret] + dec_outputs)
+				new_dec_outputs, output = outputs[:-1], outputs[-1]
+				for dec_output, new_out in zip(dec_outputs, new_dec_outputs): 
+					dec_output[:,-1,:] = new_out[:,0,:]
+				dec_outputs = [np.concatenate([x, np.zeros_like(new_out)], axis=1) for x in dec_outputs]
 
-	def beam_search(self, input_seq, topk=5, delimiter=''):
+				sampled_indexes = np.argmax(output[:,0,:], axis=-1)
+				for ii, sampled_index in enumerate(sampled_indexes):
+					if sampled_index == end_mark: ended[ii] = 1
+					if not ended[ii]: decoded_indexes[ii].append(sampled_index)
+				if sum(ended) == bs: break
+				target_one[:,0] = sampled_indexes
+			return decoded_indexes
+
+		rets = []
+		rng = range(0, src_seq.shape[0], batch_size)
+		if verbose and src_seq.shape[0] > batch_size: rng = tqdm(rng, total=len(rng))
+		for iter in rng:
+			rets.extend( decode_batch(src_seq[iter:iter+batch_size]) )
+			
+		rets = [delimiter.join(list(map(self.o_tokens.token, ret))) for ret in rets]
+		if type(input_seqs[0]) is type('') and len(rets) == 1: rets = rets[0]
+		return rets
+
+	def beam_search(self, input_seqs, topk=5, batch_size=8, length_penalty=1, delimiter='', verbose=0):
 		if self.decode_model is None: self.make_fast_decode_model()
-		src_seq = self.make_src_seq_matrix(input_seq)
-		src_seq = src_seq.repeat(topk, 0)
-		enc_ret = self.encode_model.predict_on_batch(src_seq)
+		src_seq = self.make_src_seq_matrix(input_seqs)
 
-		final_results = []
-		decoded_tokens = [[] for _ in range(topk)]
-		decoded_logps = [0] * topk
-		lastk = 1
-		target_seq = np.zeros((topk, self.len_limit), dtype='int32')
-		target_seq[:,0] = self.o_tokens.startid()
-		for i in range(self.len_limit-1):
-			if lastk == 0 or len(final_results) > topk * 3: break
-			output = self.decode_model.predict_on_batch([src_seq,enc_ret,target_seq])
-			output = np.exp(output[:,i,:])
-			output = np.log(output / np.sum(output, -1, keepdims=True) + 1e-8)
-			cands = []
-			for k, wprobs in zip(range(lastk), output):
-				if target_seq[k,i] == self.o_tokens.endid(): continue
-				wsorted = sorted(list(enumerate(wprobs)), key=lambda x:x[-1], reverse=True)
-				for wid, wp in wsorted[:topk]: 
-					cands.append( (k, wid, decoded_logps[k]+wp) )
-			cands.sort(key=lambda x:x[-1], reverse=True)
-			cands = cands[:topk]
-			backup_seq = target_seq.copy()
-			for kk, zz in enumerate(cands):
-				k, wid, wprob = zz
-				target_seq[kk,] = backup_seq[k]
-				target_seq[kk,i+1] = wid
-				decoded_logps[kk] = wprob
-				decoded_tokens.append(decoded_tokens[k] + [self.o_tokens.token(wid)]) 
-				if wid == self.o_tokens.endid(): final_results.append( (decoded_tokens[k], wprob) )
-			decoded_tokens = decoded_tokens[topk:]
-			lastk = len(cands)
-		final_results = [(x,y/(len(x)+1)) for x,y in final_results]
-		final_results.sort(key=lambda x:x[-1], reverse=True)
-		final_results = [(delimiter.join(x),y) for x,y in final_results]
-		return final_results
+		start_mark, end_mark = self.o_tokens.startid(), self.o_tokens.endid()
+		max_len = self.len_limit
+		def decode_batch(src_seq):
+			N = src_seq.shape[0]
+			src_seq = src_seq.repeat(topk, 0)
+			enc_ret = self.encode_model.predict_on_batch(src_seq)
+			bs = src_seq.shape[0]
+
+			target_one = np.zeros((bs, 1), dtype='int32')
+			target_one[:,0] = start_mark
+			d_model = self.decode_model.inputs[-1].shape[-1]
+			dec_outputs = [np.zeros((bs, 1, d_model)) for _ in self.decoder.layers]
+
+			final_results = []
+			decoded_indexes = [[] for x in range(bs)]
+			decoded_logps = [0] * bs
+			lastks = [1 for x in range(N)]
+			bests = {}
+
+			for i in range(max_len-1):
+				outputs = self.decode_model.predict_on_batch([target_one, src_seq, enc_ret] + dec_outputs)
+				new_dec_outputs, output = outputs[:-1], outputs[-1]
+				for dec_output, new_out in zip(dec_outputs, new_dec_outputs): 
+					dec_output[:,-1,:] = new_out[:,0,:]
+				dec_outputs = [np.concatenate([x, np.zeros_like(new_out)], axis=1) for x in dec_outputs]
+
+				output = np.exp(output[:,0,:])
+				output = np.log(output / np.sum(output, -1, keepdims=True) + 1e-8)
+
+				next_dec_outputs = [x.copy() for x in dec_outputs]
+				next_decoded_indexes = [1 for x in range(bs)]
+				for ii in range(N):
+					base = ii * topk
+					cands = []
+					for k, wprobs in zip(range(lastks[ii]), output[base:,:]):
+						prev = base+k
+						if len(decoded_indexes[prev]) > 0 and decoded_indexes[prev][-1] == end_mark: continue
+						wsorted = sorted(list(enumerate(wprobs)), key=lambda x:x[-1], reverse=True)
+						for wid, wp in wsorted[:topk]: 
+							wprob = decoded_logps[prev]+wp
+							if wprob < bests.get(ii, -1e+5) * 5: continue
+							cands.append( (prev, wid, wprob) )
+					cands.sort(key=lambda x:x[-1], reverse=True)	
+					cands = cands[:topk]
+					lastks[ii] = len(cands)
+					for kk, zz in enumerate(cands):
+						prev, wid, wprob = zz
+						npos = base+kk
+						for k in range(len(next_dec_outputs)):
+							next_dec_outputs[k][npos,:,:] = dec_outputs[k][prev]
+						target_one[npos,0] = wid
+						decoded_logps[npos] = wprob
+						next_decoded_indexes[npos] = decoded_indexes[prev].copy()
+						next_decoded_indexes[npos].append(wid)
+						if wid == end_mark:
+							final_results.append( (ii, decoded_indexes[prev].copy(), wprob) ) 
+							if ii not in bests or wprob > bests[ii]: bests[ii] = wprob
+				if sum(lastks) == 0: break
+				dec_outputs = next_dec_outputs
+				decoded_indexes = next_decoded_indexes
+			return final_results
+		
+		rets = {}
+		rng = range(0, src_seq.shape[0], batch_size)
+		if verbose and src_seq.shape[0] > batch_size: rng = tqdm(rng, total=len(rng))
+
+		for iter in rng:
+			for i, x, y in decode_batch(src_seq[iter:iter+batch_size]):
+				rets.setdefault(iter+i, []).append( (x, y/np.power(len(x)+1, length_penalty)) )
+		rets = {x:sorted(ys,key=lambda x:x[-1], reverse=True) for x,ys in rets.items()}
+		rets = [rets[i] for i in range(len(rets))]
+
+		rets = [[(delimiter.join(list(map(self.o_tokens.token, x))), y) for x, y in r] for r in rets]
+		if type(input_seqs[0]) is type('') and len(rets) == 1: rets = rets[0]
+		return rets
+
 
 class LRSchedulerPerStep(Callback):
 	def __init__(self, d_model, warmup=4000):
