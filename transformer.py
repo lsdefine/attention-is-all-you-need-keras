@@ -240,7 +240,7 @@ class ReadoutDecoderCell(Layer):
 		dec_mask = dec_mask + col_mask
 
 		tgt_emb = self.o_word_emb(tgt_curr_input)
-		if self.pos_emb: tgt_emb = tgt_emb + self.pos_emb(tgt_pos_input)
+		if self.pos_emb: tgt_emb = tgt_emb + self.pos_emb(tgt_pos_input, pos_input=True)
 
 		x = tgt_emb
 		xs = []
@@ -294,6 +294,95 @@ class InferRNN(Layer):
 		output = outputs if self.return_sequences else last_output
 		return output
 
+def decode_batch_greedy(src_seq, encode_model, decode_model, start_mark, end_mark, max_len=128):
+	enc_ret = encode_model.predict_on_batch(src_seq)
+	bs = src_seq.shape[0]
+	target_one = np.zeros((bs, 1), dtype='int32')
+	target_one[:,0] = start_mark
+	d_model = decode_model.inputs[-1].shape[-1]
+	n_dlayers = len(decode_model.inputs) - 3
+	dec_outputs = [np.zeros((bs, 1, d_model)) for _ in range(n_dlayers)]
+	ended = [0 for x in range(bs)]
+	decoded_indexes = [[] for x in range(bs)]
+	for i in range(max_len-1):
+		outputs = decode_model.predict_on_batch([target_one, src_seq, enc_ret] + dec_outputs)
+		new_dec_outputs, output = outputs[:-1], outputs[-1]
+		for dec_output, new_out in zip(dec_outputs, new_dec_outputs): 
+			dec_output[:,-1,:] = new_out[:,0,:]
+		dec_outputs = [np.concatenate([x, np.zeros_like(new_out)], axis=1) for x in dec_outputs]
+
+		sampled_indexes = np.argmax(output[:,0,:], axis=-1)
+		for ii, sampled_index in enumerate(sampled_indexes):
+			if sampled_index == end_mark: ended[ii] = 1
+			if not ended[ii]: decoded_indexes[ii].append(sampled_index)
+		if sum(ended) == bs: break
+		target_one[:,0] = sampled_indexes
+	return decoded_indexes
+
+def decode_batch_beam_search(src_seq, topk, encode_model, decode_model, start_mark, end_mark, max_len=128, early_stop_mult=5):
+	N = src_seq.shape[0]
+	src_seq = src_seq.repeat(topk, 0)
+	enc_ret = encode_model.predict_on_batch(src_seq)
+	bs = src_seq.shape[0]
+
+	target_one = np.zeros((bs, 1), dtype='int32')
+	target_one[:,0] = start_mark
+	d_model = decode_model.inputs[-1].shape[-1]
+	n_dlayers = len(decode_model.inputs) - 3
+	dec_outputs = [np.zeros((bs, 1, d_model)) for _ in range(n_dlayers)]
+
+	final_results = []
+	decoded_indexes = [[] for x in range(bs)]
+	decoded_logps = [0] * bs
+	lastks = [1 for x in range(N)]
+	bests = {}
+	for i in range(max_len-1):
+		outputs = decode_model.predict_on_batch([target_one, src_seq, enc_ret] + dec_outputs)
+		new_dec_outputs, output = outputs[:-1], outputs[-1]
+		for dec_output, new_out in zip(dec_outputs, new_dec_outputs): 
+			dec_output[:,-1,:] = new_out[:,0,:]
+
+		dec_outputs = [np.concatenate([x, np.zeros_like(new_out)], axis=1) for x in dec_outputs]
+
+		output = np.exp(output[:,0,:])
+		output = np.log(output / np.sum(output, -1, keepdims=True) + 1e-8)
+
+		next_dec_outputs = [x.copy() for x in dec_outputs]
+		next_decoded_indexes = [1 for x in range(bs)]
+
+		for ii in range(N):
+			base = ii * topk
+			cands = []
+			for k, wprobs in zip(range(lastks[ii]), output[base:,:]):
+				prev = base+k
+				if len(decoded_indexes[prev]) > 0 and decoded_indexes[prev][-1] == end_mark: continue
+				ind = np.argpartition(wprobs, -topk)[-topk:]
+				wsorted = [(k,x) for k,x in zip(ind, wprobs[ind])]
+				#wsorted = sorted(list(enumerate(wprobs)), key=lambda x:x[-1], reverse=True)   # slow
+				for wid, wp in wsorted[:topk]: 
+					wprob = decoded_logps[prev]+wp
+					if wprob < bests.get(ii, -1e5) * early_stop_mult: continue
+					cands.append( (prev, wid, wprob) )
+			cands.sort(key=lambda x:x[-1], reverse=True)	
+			cands = cands[:topk]
+			lastks[ii] = len(cands)
+			for kk, zz in enumerate(cands):
+				prev, wid, wprob = zz
+				npos = base+kk
+				for k in range(len(next_dec_outputs)):
+					next_dec_outputs[k][npos,:,:] = dec_outputs[k][prev]
+				target_one[npos,0] = wid
+				decoded_logps[npos] = wprob
+				next_decoded_indexes[npos] = decoded_indexes[prev].copy()
+				next_decoded_indexes[npos].append(wid)
+				if wid == end_mark:
+					final_results.append( (ii, decoded_indexes[prev].copy(), wprob) ) 
+					if ii not in bests or wprob > bests[ii]: bests[ii] = wprob
+		if sum(lastks) == 0: break
+		dec_outputs = next_dec_outputs
+		decoded_indexes = next_decoded_indexes
+	return final_results
+
 class Transformer:
 	def __init__(self, i_tokens, o_tokens, len_limit, d_model=256, \
 			  d_inner_hid=512, n_head=4, layers=2, dropout=0.1, \
@@ -301,18 +390,18 @@ class Transformer:
 		self.i_tokens = i_tokens
 		self.o_tokens = o_tokens
 		self.len_limit = len_limit
-		self.src_loc_info = True
 		self.d_model = d_model
 		self.decode_model = None
 		self.readout_model = None
 		self.layers = layers
 		d_emb = d_model
 
+		self.src_loc_info = True
+
 		d_k = d_v = d_model // n_head
 		assert d_k * n_head == d_model and d_v == d_k
 
-		self.pos_emb = Embedding(len_limit, d_emb, trainable=False, \
-						   weights=[GetPosEncodingMatrix(len_limit, d_emb)])
+		self.pos_emb = PosEncodingLayer(len_limit, d_emb) if self.src_loc_info else None
 
 		self.emb_dropout = Dropout(dropout)
 
@@ -326,11 +415,6 @@ class Transformer:
 		self.decoder = Decoder(d_model, d_inner_hid, n_head, layers, dropout)
 		self.target_layer = TimeDistributed(Dense(o_tokens.num(), use_bias=False))
 
-	def get_pos_seq(self, x):
-		mask = K.cast(K.not_equal(x, 0), 'int32')
-		pos = K.cumsum(K.ones_like(x, 'int32'), 1)
-		return pos * mask
-
 	def compile(self, optimizer='adam', active_layers=999):
 		src_seq_input = Input(shape=(None,), dtype='int32')
 		tgt_seq_input = Input(shape=(None,), dtype='int32')
@@ -339,15 +423,12 @@ class Transformer:
 		tgt_seq  = Lambda(lambda x:x[:,:-1])(tgt_seq_input)
 		tgt_true = Lambda(lambda x:x[:,1:])(tgt_seq_input)
 
-		src_pos = Lambda(self.get_pos_seq)(src_seq)
-		tgt_pos = Lambda(self.get_pos_seq)(tgt_seq)
-
 		src_emb = self.i_word_emb(src_seq)
 		tgt_emb = self.o_word_emb(tgt_seq)
 
-		if self.src_loc_info: 
-			src_emb = add_layer([src_emb, self.pos_emb(src_pos)])
-			tgt_emb = add_layer([tgt_emb, self.pos_emb(tgt_pos)])
+		if self.pos_emb: 
+			src_emb = add_layer([src_emb, self.pos_emb(src_seq)])
+			tgt_emb = add_layer([tgt_emb, self.pos_emb(tgt_seq)])
 		src_emb = self.emb_dropout(src_emb)
 
 		enc_output = self.encoder(src_emb, src_seq, active_layers=active_layers)
@@ -398,9 +479,9 @@ class Transformer:
 		src_seq = src_seq_input
 		enc_mask = Lambda(lambda x:K.cast(K.greater(x, 0), 'float32'))(src_seq)
 		src_emb = self.i_word_emb(src_seq)
-		if self.src_loc_info: 
-			src_pos = Lambda(self.get_pos_seq)(src_seq)
-			src_emb = add_layer([src_emb, self.pos_emb(src_pos)])
+		if self.pos_emb: 
+			src_emb = add_layer([src_emb, self.pos_emb(src_seq)])
+
 		src_emb = self.emb_dropout(src_emb)
 		enc_output = self.encoder(src_emb, src_seq)
 
@@ -408,7 +489,7 @@ class Transformer:
 		tgt_seq = Lambda(lambda x:K.repeat_elements(x, max_output_len, 1))(tgt_start_input)
 		rep_input = Lambda(lambda x:K.repeat_elements(x, max_output_len, 1))(tgt_emb)
 	
-		cell = ReadoutDecoderCell(self.o_word_emb, self.pos_emb if self.src_loc_info else None, self.decoder, self.target_layer)
+		cell = ReadoutDecoderCell(self.o_word_emb, self.pos_emb, self.decoder, self.target_layer)
 		final_output = InferRNN(cell, return_sequences=True)(rep_input, 
 				initial_state=[tgt_start_input, K.ones_like(tgt_start_input), K.zeros_like(tgt_seq)] + \
 						[rep_input for _ in self.decoder.layers], 
@@ -443,10 +524,8 @@ class Transformer:
 
 	def make_fast_decode_model(self):
 		src_seq_input = Input(shape=(None,), dtype='int32')
-		src_pos = Lambda(self.get_pos_seq)(src_seq_input)
 		src_emb = self.i_word_emb(src_seq_input)
-		if self.src_loc_info: 
-			src_emb = add_layer([src_emb, self.pos_emb(src_pos)])
+		if self.pos_emb: src_emb = add_layer([src_emb, self.pos_emb(src_seq_input)])
 		src_emb = self.emb_dropout(src_emb)
 		enc_output = self.encoder(src_emb, src_seq_input)
 		self.encode_model = Model(src_seq_input, enc_output)
@@ -457,11 +536,11 @@ class Transformer:
 		tgt_one_input = Input(shape=(1,), dtype='int32')
 		enc_ret_input = Input(shape=(None, self.d_model))
 		dec_ret_inputs = [Input(shape=(None, self.d_model)) for _ in self.decoder.layers]
+
 		tgt_pos = Lambda(lambda x:tf.shape(x)[1])(dec_ret_inputs[0])
 
 		tgt_one = self.o_word_emb(tgt_one_input)
-		if self.src_loc_info: 
-			tgt_one = add_layer([tgt_one, self.pos_emb(tgt_pos)])
+		if self.pos_emb: tgt_one = add_layer([tgt_one, self.pos_emb(tgt_pos, pos_input=True)])
 
 		dec_outputs = self.decoder_pre_step([tgt_one, src_seq_input, enc_ret_input]+dec_ret_inputs)	
 		final_output = self.target_layer(dec_outputs[-1])
@@ -476,30 +555,11 @@ class Transformer:
 
 		start_mark, end_mark = self.o_tokens.startid(), self.o_tokens.endid()
 		max_len = self.len_limit
-		def decode_batch(src_seq):
-			enc_ret = self.encode_model.predict_on_batch(src_seq)
-			bs = src_seq.shape[0]
-			target_one = np.zeros((bs, 1), dtype='int32')
-			target_one[:,0] = start_mark
-			d_model = self.decode_model.inputs[-1].shape[-1]
-			dec_outputs = [np.zeros((bs, 1, d_model)) for _ in self.decoder.layers]
-			ended = [0 for x in range(bs)]
-			decoded_indexes = [[] for x in range(bs)]
-			for i in range(max_len-1):
-				outputs = self.decode_model.predict_on_batch([target_one, src_seq, enc_ret] + dec_outputs)
-				new_dec_outputs, output = outputs[:-1], outputs[-1]
-				for dec_output, new_out in zip(dec_outputs, new_dec_outputs): 
-					dec_output[:,-1,:] = new_out[:,0,:]
-				dec_outputs = [np.concatenate([x, np.zeros_like(new_out)], axis=1) for x in dec_outputs]
+		encode_model = self.encode_model
+		decode_model = self.decode_model
 
-				sampled_indexes = np.argmax(output[:,0,:], axis=-1)
-				for ii, sampled_index in enumerate(sampled_indexes):
-					if sampled_index == end_mark: ended[ii] = 1
-					if not ended[ii]: decoded_indexes[ii].append(sampled_index)
-				if sum(ended) == bs: break
-				target_one[:,0] = sampled_indexes
-			return decoded_indexes
-
+		decode_batch = lambda x: decode_batch_greedy(x, encode_model, decode_model, start_mark, end_mark, max_len)
+		
 		rets = []
 		rng = range(0, src_seq.shape[0], batch_size)
 		if verbose and src_seq.shape[0] > batch_size: rng = tqdm(rng, total=len(rng))
@@ -516,65 +576,11 @@ class Transformer:
 
 		start_mark, end_mark = self.o_tokens.startid(), self.o_tokens.endid()
 		max_len = self.len_limit
-		def decode_batch(src_seq):
-			N = src_seq.shape[0]
-			src_seq = src_seq.repeat(topk, 0)
-			enc_ret = self.encode_model.predict_on_batch(src_seq)
-			bs = src_seq.shape[0]
+		encode_model = self.encode_model
+		decode_model = self.decode_model
 
-			target_one = np.zeros((bs, 1), dtype='int32')
-			target_one[:,0] = start_mark
-			d_model = self.decode_model.inputs[-1].shape[-1]
-			dec_outputs = [np.zeros((bs, 1, d_model)) for _ in self.decoder.layers]
-
-			final_results = []
-			decoded_indexes = [[] for x in range(bs)]
-			decoded_logps = [0] * bs
-			lastks = [1 for x in range(N)]
-			bests = {}
-
-			for i in range(max_len-1):
-				outputs = self.decode_model.predict_on_batch([target_one, src_seq, enc_ret] + dec_outputs)
-				new_dec_outputs, output = outputs[:-1], outputs[-1]
-				for dec_output, new_out in zip(dec_outputs, new_dec_outputs): 
-					dec_output[:,-1,:] = new_out[:,0,:]
-				dec_outputs = [np.concatenate([x, np.zeros_like(new_out)], axis=1) for x in dec_outputs]
-
-				output = np.exp(output[:,0,:])
-				output = np.log(output / np.sum(output, -1, keepdims=True) + 1e-8)
-
-				next_dec_outputs = [x.copy() for x in dec_outputs]
-				next_decoded_indexes = [1 for x in range(bs)]
-				for ii in range(N):
-					base = ii * topk
-					cands = []
-					for k, wprobs in zip(range(lastks[ii]), output[base:,:]):
-						prev = base+k
-						if len(decoded_indexes[prev]) > 0 and decoded_indexes[prev][-1] == end_mark: continue
-						wsorted = sorted(list(enumerate(wprobs)), key=lambda x:x[-1], reverse=True)
-						for wid, wp in wsorted[:topk]: 
-							wprob = decoded_logps[prev]+wp
-							if wprob < bests.get(ii, -1e+5) * 5: continue
-							cands.append( (prev, wid, wprob) )
-					cands.sort(key=lambda x:x[-1], reverse=True)	
-					cands = cands[:topk]
-					lastks[ii] = len(cands)
-					for kk, zz in enumerate(cands):
-						prev, wid, wprob = zz
-						npos = base+kk
-						for k in range(len(next_dec_outputs)):
-							next_dec_outputs[k][npos,:,:] = dec_outputs[k][prev]
-						target_one[npos,0] = wid
-						decoded_logps[npos] = wprob
-						next_decoded_indexes[npos] = decoded_indexes[prev].copy()
-						next_decoded_indexes[npos].append(wid)
-						if wid == end_mark:
-							final_results.append( (ii, decoded_indexes[prev].copy(), wprob) ) 
-							if ii not in bests or wprob > bests[ii]: bests[ii] = wprob
-				if sum(lastks) == 0: break
-				dec_outputs = next_dec_outputs
-				decoded_indexes = next_decoded_indexes
-			return final_results
+		decode_batch = lambda x: decode_batch_beam_search(x, topk, encode_model, decode_model,
+													start_mark, end_mark, max_len)
 		
 		rets = {}
 		rng = range(0, src_seq.shape[0], batch_size)
@@ -589,7 +595,26 @@ class Transformer:
 		rets = [[(delimiter.join(list(map(self.o_tokens.token, x))), y) for x, y in r] for r in rets]
 		if type(input_seqs[0]) is type('') and len(rets) == 1: rets = rets[0]
 		return rets
+	
+class PosEncodingLayer:
+	def __init__(self, max_len, d_emb):
+		self.pos_emb_matrix = Embedding(max_len, d_emb, trainable=False, \
+						   weights=[GetPosEncodingMatrix(max_len, d_emb)])
+	def get_pos_seq(self, x):
+		mask = K.cast(K.not_equal(x, 0), 'int32')
+		pos = K.cumsum(K.ones_like(x, 'int32'), 1)
+		return pos * mask
+	def __call__(self, seq, pos_input=False):
+		x = seq
+		if not pos_input: x = Lambda(self.get_pos_seq)(x)
+		return self.pos_emb_matrix(x)
 
+class AddPosEncoding:
+	def __call__(self, x):
+		_, max_len, d_emb = K.int_shape(x)
+		pos = GetPosEncodingMatrix(max_len, d_emb)
+		x = Lambda(lambda x:x+pos)(x)
+		return x
 
 class LRSchedulerPerStep(Callback):
 	def __init__(self, d_model, warmup=4000):
@@ -601,13 +626,6 @@ class LRSchedulerPerStep(Callback):
 		lr = self.basic * min(self.step_num**-0.5, self.step_num*self.warm)
 		K.set_value(self.model.optimizer.lr, lr)
 
-class AddPosEncoding:
-	def __call__(self, x):
-		_, max_len, d_emb = K.int_shape(x)
-		pos = GetPosEncodingMatrix(max_len, d_emb)
-		x = Lambda(lambda x:x+pos)(x)
-		return x
-	
 add_layer = Lambda(lambda x:x[0]+x[1], output_shape=lambda x:x[0])
 # use this because keras may get wrong shapes with Add()([])
 
