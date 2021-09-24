@@ -1,9 +1,9 @@
 import os, sys
 import dataloader as dd
-from keras.optimizers import *
-from keras.callbacks import *
+from tensorflow.keras.optimizers import *
+from tensorflow.keras.callbacks import *
 
-itokens, otokens = dd.MakeS2SDict('data/pinyin.corpus.txt', dict_file='data/pinyin_word.txt')
+itokens, otokens = dd.MakeS2SDict('data/pinyin.corpus.examples.txt', dict_file='data/pinyin_word.txt')
 
 print('seq 1 words:', itokens.num())
 print('seq 2 words:', otokens.num())
@@ -27,15 +27,15 @@ except: print('\n\nnew model')
 
 cmds = sys.argv[1:]
 if 'train' in cmds:
-	gen = dd.S2SDataGenerator('data/pinyin.corpus.txt', itokens, otokens, batch_size=32, max_len=120)
+	gen = dd.S2SDataGenerator('data/pinyin.corpus.examples.txt', itokens, otokens, batch_size=32, max_len=120)
 	rr = next(gen); print(rr[0][0].shape, rr[0][1].shape)
 	rr = next(gen); print(rr[0][0].shape, rr[0][1].shape)
 	s2s.compile(opt, active_layers=1)
-	s2s.model.fit_generator(gen, steps_per_epoch=2000, epochs=5, callbacks=[lr_scheduler, model_saver])
+	s2s.model.fit(gen, steps_per_epoch=200, epochs=5, callbacks=[lr_scheduler, model_saver])
 	s2s.compile(opt, active_layers=2)
-	s2s.model.fit_generator(gen, steps_per_epoch=2000, epochs=5, callbacks=[lr_scheduler, model_saver])
+	s2s.model.fit(gen, steps_per_epoch=200, epochs=5, callbacks=[lr_scheduler, model_saver])
 	s2s.compile(opt, active_layers=3)
-	s2s.model.fit_generator(gen, steps_per_epoch=2000, epochs=60, callbacks=[lr_scheduler, model_saver])
+	s2s.model.fit(gen, steps_per_epoch=200, epochs=5, callbacks=[lr_scheduler, model_saver])
 elif 'test' in cmds:
 	print(s2s.decode_sequence_fast('ji zhi hu die zai yang guang xia fei wu 。'.split()))
 	while True:

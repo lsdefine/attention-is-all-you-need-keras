@@ -1,7 +1,8 @@
-from keras.models import *
-from keras.layers import *
-from keras.callbacks import *
 import tensorflow as tf
+from tensorflow.keras.models import *
+from tensorflow.keras.layers import *
+from tensorflow.keras.callbacks import *
+import tensorflow.keras.backend as K
 
 from dataloader import TokenList, pad_to_longest
 	
@@ -83,11 +84,9 @@ class RNNSeq2Seq:
 		self.decoder_model = decoder_model
 
 	def compile(self, optimizer):
+		self.model.add_metric(self.ppl, name='ppl')
+		self.model.add_metric(self.accu, name='accu')
 		self.model.compile(optimizer, None)
-		self.model.metrics_names.append('ppl')
-		self.model.metrics_tensors.append(self.ppl)
-		self.model.metrics_names.append('accu')
-		self.model.metrics_tensors.append(self.accu)
 
 	def decode_sequence(self, input_seq, delimiter=''):
 		input_mat = np.zeros((1, len(input_seq)+3))

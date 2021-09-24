@@ -1,10 +1,11 @@
 import random, os, sys
 import numpy as np
-from keras.models import *
-from keras.layers import *
-from keras.callbacks import *
-from keras.initializers import *
 import tensorflow as tf
+from tensorflow.keras.models import *
+from tensorflow.keras.layers import *
+from tensorflow.keras.callbacks import *
+from tensorflow.keras.initializers import *
+import tensorflow.keras.backend as K
 
 try:
 	from tqdm import tqdm
@@ -33,7 +34,7 @@ class ScaledDotProductAttention():
 		self.dropout = Dropout(attn_dropout)
 	def __call__(self, q, k, v, mask):   # mask_k or mask_qk
 		temper = tf.sqrt(tf.cast(tf.shape(k)[-1], dtype='float32'))
-		attn = Lambda(lambda x:K.batch_dot(x[0],x[1],axes=[2,2])/temper)([q, k])  # shape=(batch, q, k)
+		attn = Lambda(lambda x:K.batch_dot(x[0],x[1],axes=[2,2])/x[2])([q, k, temper])  # shape=(batch, q, k)
 		if mask is not None:
 			mmask = Lambda(lambda x:(-1e+9)*(1.-K.cast(x, 'float32')))(mask)
 			attn = Add()([attn, mmask])
@@ -295,7 +296,7 @@ class InferRNN(Layer):
 		return output
 
 def decode_batch_greedy(src_seq, encode_model, decode_model, start_mark, end_mark, max_len=128):
-	enc_ret = encode_model.predict_on_batch(src_seq)
+	enc_ret = encode_model(src_seq).numpy()
 	bs = src_seq.shape[0]
 	target_one = np.zeros((bs, 1), dtype='int32')
 	target_one[:,0] = start_mark
@@ -305,7 +306,7 @@ def decode_batch_greedy(src_seq, encode_model, decode_model, start_mark, end_mar
 	ended = [0 for x in range(bs)]
 	decoded_indexes = [[] for x in range(bs)]
 	for i in range(max_len-1):
-		outputs = decode_model.predict_on_batch([target_one, src_seq, enc_ret] + dec_outputs)
+		outputs = [x.numpy() for x in decode_model([target_one, src_seq, enc_ret] + dec_outputs)]
 		new_dec_outputs, output = outputs[:-1], outputs[-1]
 		for dec_output, new_out in zip(dec_outputs, new_dec_outputs): 
 			dec_output[:,-1,:] = new_out[:,0,:]
@@ -322,7 +323,7 @@ def decode_batch_greedy(src_seq, encode_model, decode_model, start_mark, end_mar
 def decode_batch_beam_search(src_seq, topk, encode_model, decode_model, start_mark, end_mark, max_len=128, early_stop_mult=5):
 	N = src_seq.shape[0]
 	src_seq = src_seq.repeat(topk, 0)
-	enc_ret = encode_model.predict_on_batch(src_seq)
+	enc_ret = encode_model(src_seq).numpy()
 	bs = src_seq.shape[0]
 
 	target_one = np.zeros((bs, 1), dtype='int32')
@@ -337,7 +338,7 @@ def decode_batch_beam_search(src_seq, topk, encode_model, decode_model, start_ma
 	lastks = [1 for x in range(N)]
 	bests = {}
 	for i in range(max_len-1):
-		outputs = decode_model.predict_on_batch([target_one, src_seq, enc_ret] + dec_outputs)
+		outputs = [x.numpy() for x in decode_model([target_one, src_seq, enc_ret] + dec_outputs)]
 		new_dec_outputs, output = outputs[:-1], outputs[-1]
 		for dec_output, new_out in zip(dec_outputs, new_dec_outputs): 
 			dec_output[:,-1,:] = new_out[:,0,:]
@@ -455,12 +456,10 @@ class Transformer:
 
 		self.model = Model([src_seq_input, tgt_seq_input], final_output)
 		self.model.add_loss([loss])
-		
+		self.model.add_metric(self.ppl, name='ppl')
+		self.model.add_metric(self.accu, name='accu')
+
 		self.model.compile(optimizer, None)
-		self.model.metrics_names.append('ppl')
-		self.model.metrics_tensors.append(self.ppl)
-		self.model.metrics_names.append('accu')
-		self.model.metrics_tensors.append(self.accu)
 
 	def make_src_seq_matrix(self, input_seqs):
 		if type(input_seqs[0]) == type(''): input_seqs = [input_seqs]
