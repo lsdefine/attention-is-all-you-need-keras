@@ -408,7 +408,7 @@ class Transformer:
 		self.i_word_emb = Embedding(i_tokens.num(), d_emb)
 		if share_word_emb: 
 			assert i_tokens.num() == o_tokens.num()
-			self.o_word_emb = i_word_emb
+			self.o_word_emb = self.i_word_emb
 		else: self.o_word_emb = Embedding(o_tokens.num(), d_emb)
 
 		self.encoder = SelfAttention(d_model, d_inner_hid, n_head, layers, dropout)
